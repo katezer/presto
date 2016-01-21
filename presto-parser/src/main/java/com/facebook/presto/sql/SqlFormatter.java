@@ -17,6 +17,9 @@ import com.facebook.presto.sql.tree.AddColumn;
 import com.facebook.presto.sql.tree.AliasedRelation;
 import com.facebook.presto.sql.tree.AllColumns;
 import com.facebook.presto.sql.tree.AstVisitor;
+import com.facebook.presto.sql.tree.Call;
+import com.facebook.presto.sql.tree.CallArgument;
+import com.facebook.presto.sql.tree.Commit;
 import com.facebook.presto.sql.tree.CreateTable;
 import com.facebook.presto.sql.tree.CreateTableAsSelect;
 import com.facebook.presto.sql.tree.CreateView;
@@ -31,6 +34,7 @@ import com.facebook.presto.sql.tree.ExplainType;
 import com.facebook.presto.sql.tree.Expression;
 import com.facebook.presto.sql.tree.Insert;
 import com.facebook.presto.sql.tree.Intersect;
+import com.facebook.presto.sql.tree.Isolation;
 import com.facebook.presto.sql.tree.Join;
 import com.facebook.presto.sql.tree.JoinCriteria;
 import com.facebook.presto.sql.tree.JoinOn;
@@ -43,6 +47,7 @@ import com.facebook.presto.sql.tree.Relation;
 import com.facebook.presto.sql.tree.RenameColumn;
 import com.facebook.presto.sql.tree.RenameTable;
 import com.facebook.presto.sql.tree.ResetSession;
+import com.facebook.presto.sql.tree.Rollback;
 import com.facebook.presto.sql.tree.SampledRelation;
 import com.facebook.presto.sql.tree.Select;
 import com.facebook.presto.sql.tree.SelectItem;
@@ -55,8 +60,11 @@ import com.facebook.presto.sql.tree.ShowSchemas;
 import com.facebook.presto.sql.tree.ShowSession;
 import com.facebook.presto.sql.tree.ShowTables;
 import com.facebook.presto.sql.tree.SingleColumn;
+import com.facebook.presto.sql.tree.StartTransaction;
 import com.facebook.presto.sql.tree.Table;
 import com.facebook.presto.sql.tree.TableSubquery;
+import com.facebook.presto.sql.tree.TransactionAccessMode;
+import com.facebook.presto.sql.tree.TransactionMode;
 import com.facebook.presto.sql.tree.Union;
 import com.facebook.presto.sql.tree.Unnest;
 import com.facebook.presto.sql.tree.Values;
@@ -70,6 +78,7 @@ import java.util.Iterator;
 import java.util.List;
 
 import static com.facebook.presto.sql.ExpressionFormatter.formatExpression;
+import static com.facebook.presto.sql.ExpressionFormatter.formatGroupBy;
 import static com.facebook.presto.sql.ExpressionFormatter.formatSortItems;
 import static com.facebook.presto.sql.ExpressionFormatter.formatStringLiteral;
 import static com.google.common.base.Preconditions.checkArgument;
@@ -194,8 +203,7 @@ public final class SqlFormatter
             }
 
             if (!node.getGroupBy().isEmpty()) {
-                append(indent, "GROUP BY " + Joiner.on(", ").join(transform(node.getGroupBy(), ExpressionFormatter::formatExpression)))
-                        .append('\n');
+                append(indent, "GROUP BY " + formatGroupBy(node.getGroupBy())).append('\n');
             }
 
             if (node.getHaving().isPresent()) {
@@ -705,6 +713,12 @@ public final class SqlFormatter
                     .append(node.getTarget())
                     .append(" ");
 
+            if (node.getColumns().isPresent()) {
+                builder.append("(")
+                        .append(Joiner.on(", ").join(node.getColumns().get()))
+                        .append(") ");
+            }
+
             process(node.getQuery(), indent);
 
             return null;
@@ -727,6 +741,82 @@ public final class SqlFormatter
             builder.append("RESET SESSION ")
                     .append(node.getName());
 
+            return null;
+        }
+
+        @Override
+        protected Void visitCallArgument(CallArgument node, Integer indent)
+        {
+            if (node.getName().isPresent()) {
+                builder.append(node.getName().get())
+                        .append(" => ");
+            }
+            builder.append(formatExpression(node.getValue()));
+
+            return null;
+        }
+
+        @Override
+        protected Void visitCall(Call node, Integer indent)
+        {
+            builder.append("CALL ")
+                    .append(node.getName())
+                    .append("(");
+
+            Iterator<CallArgument> arguments = node.getArguments().iterator();
+            while (arguments.hasNext()) {
+                process(arguments.next(), indent);
+                if (arguments.hasNext()) {
+                    builder.append(", ");
+                }
+            }
+
+            builder.append(")");
+
+            return null;
+        }
+
+        @Override
+        protected Void visitStartTransaction(StartTransaction node, Integer indent)
+        {
+            builder.append("START TRANSACTION");
+
+            Iterator<TransactionMode> iterator = node.getTransactionModes().iterator();
+            while (iterator.hasNext()) {
+                builder.append(" ");
+                process(iterator.next(), indent);
+                if (iterator.hasNext()) {
+                    builder.append(",");
+                }
+            }
+            return null;
+        }
+
+        @Override
+        protected Void visitIsolationLevel(Isolation node, Integer indent)
+        {
+            builder.append("ISOLATION LEVEL ").append(node.getLevel().getText());
+            return null;
+        }
+
+        @Override
+        protected Void visitTransactionAccessMode(TransactionAccessMode node, Integer context)
+        {
+            builder.append(node.isReadOnly() ? "READ ONLY" : "READ WRITE");
+            return null;
+        }
+
+        @Override
+        protected Void visitCommit(Commit node, Integer context)
+        {
+            builder.append("COMMIT");
+            return null;
+        }
+
+        @Override
+        protected Void visitRollback(Rollback node, Integer context)
+        {
+            builder.append("ROLLBACK");
             return null;
         }
 

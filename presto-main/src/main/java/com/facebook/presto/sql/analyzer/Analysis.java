@@ -13,7 +13,7 @@
  */
 package com.facebook.presto.sql.analyzer;
 
-import com.facebook.presto.metadata.QualifiedTableName;
+import com.facebook.presto.metadata.QualifiedObjectName;
 import com.facebook.presto.metadata.Signature;
 import com.facebook.presto.metadata.TableHandle;
 import com.facebook.presto.spi.ColumnHandle;
@@ -28,12 +28,15 @@ import com.facebook.presto.sql.tree.Query;
 import com.facebook.presto.sql.tree.QuerySpecification;
 import com.facebook.presto.sql.tree.Relation;
 import com.facebook.presto.sql.tree.SampledRelation;
+import com.facebook.presto.sql.tree.SubqueryExpression;
 import com.facebook.presto.sql.tree.Table;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.SetMultimap;
+
+import javax.annotation.concurrent.Immutable;
 
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -42,6 +45,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static java.util.Objects.requireNonNull;
 
 public class Analysis
@@ -51,12 +55,12 @@ public class Analysis
 
     private final IdentityHashMap<Table, Query> namedQueries = new IdentityHashMap<>();
 
-    private TupleDescriptor outputDescriptor;
-    private final IdentityHashMap<Node, TupleDescriptor> outputDescriptors = new IdentityHashMap<>();
+    private RelationType outputDescriptor;
+    private final IdentityHashMap<Node, RelationType> outputDescriptors = new IdentityHashMap<>();
     private final IdentityHashMap<Expression, Integer> resolvedNames = new IdentityHashMap<>();
 
     private final IdentityHashMap<QuerySpecification, List<FunctionCall>> aggregates = new IdentityHashMap<>();
-    private final IdentityHashMap<QuerySpecification, List<FieldOrExpression>> groupByExpressions = new IdentityHashMap<>();
+    private final IdentityHashMap<QuerySpecification, List<List<FieldOrExpression>>> groupByExpressions = new IdentityHashMap<>();
     private final IdentityHashMap<Node, Expression> where = new IdentityHashMap<>();
     private final IdentityHashMap<QuerySpecification, Expression> having = new IdentityHashMap<>();
     private final IdentityHashMap<Node, List<FieldOrExpression>> orderByExpressions = new IdentityHashMap<>();
@@ -65,6 +69,7 @@ public class Analysis
 
     private final IdentityHashMap<Join, Expression> joins = new IdentityHashMap<>();
     private final SetMultimap<Node, InPredicate> inPredicates = HashMultimap.create();
+    private final SetMultimap<Node, SubqueryExpression> scalarSubqueries = HashMultimap.create();
     private final IdentityHashMap<Join, JoinInPredicates> joinInPredicates = new IdentityHashMap<>();
 
     private final IdentityHashMap<Table, TableHandle> tables = new IdentityHashMap<>();
@@ -79,12 +84,11 @@ public class Analysis
     private final IdentityHashMap<SampledRelation, Double> sampleRatios = new IdentityHashMap<>();
 
     // for create table
-    private Optional<QualifiedTableName> createTableDestination = Optional.empty();
+    private Optional<QualifiedObjectName> createTableDestination = Optional.empty();
     private Map<String, Expression> createTableProperties = ImmutableMap.of();
     private boolean createTableAsSelectWithData = true;
 
-    // for insert
-    private Optional<TableHandle> insertTarget = Optional.empty();
+    private Optional<Insert> insert = Optional.empty();
 
     // for delete
     private Optional<Delete> delete = Optional.empty();
@@ -146,7 +150,7 @@ public class Analysis
 
     public Type getType(Expression expression)
     {
-        Preconditions.checkArgument(types.containsKey(expression), "Expression not analyzed: %s", expression);
+        checkArgument(types.containsKey(expression), "Expression not analyzed: %s", expression);
         return types.get(expression);
     }
 
@@ -170,12 +174,12 @@ public class Analysis
         return coercions.get(expression);
     }
 
-    public void setGroupByExpressions(QuerySpecification node, List<FieldOrExpression> expressions)
+    public void setGroupingSets(QuerySpecification node, List<List<FieldOrExpression>> expressions)
     {
         groupByExpressions.put(node, expressions);
     }
 
-    public List<FieldOrExpression> getGroupByExpressions(QuerySpecification node)
+    public List<List<FieldOrExpression>> getGroupingSets(QuerySpecification node)
     {
         return groupByExpressions.get(node);
     }
@@ -225,14 +229,20 @@ public class Analysis
         return joins.get(join);
     }
 
-    public void addInPredicates(Node node, Set<InPredicate> inPredicates)
+    public void recordSubqueries(Node node, ExpressionAnalysis expressionAnalysis)
     {
-        this.inPredicates.putAll(node, inPredicates);
+        this.inPredicates.putAll(node, expressionAnalysis.getSubqueryInPredicates());
+        this.scalarSubqueries.putAll(node, expressionAnalysis.getScalarSubqueries());
     }
 
     public Set<InPredicate> getInPredicates(Node node)
     {
         return inPredicates.get(node);
+    }
+
+    public Set<SubqueryExpression> getScalarSubqueries(Node node)
+    {
+        return scalarSubqueries.get(node);
     }
 
     public void addJoinInPredicates(Join node, JoinInPredicates joinInPredicates)
@@ -260,22 +270,22 @@ public class Analysis
         return windowFunctions.get(query);
     }
 
-    public void setOutputDescriptor(TupleDescriptor descriptor)
+    public void setOutputDescriptor(RelationType descriptor)
     {
         outputDescriptor = descriptor;
     }
 
-    public TupleDescriptor getOutputDescriptor()
+    public RelationType getOutputDescriptor()
     {
         return outputDescriptor;
     }
 
-    public void setOutputDescriptor(Node node, TupleDescriptor descriptor)
+    public void setOutputDescriptor(Node node, RelationType descriptor)
     {
         outputDescriptors.put(node, descriptor);
     }
 
-    public TupleDescriptor getOutputDescriptor(Node node)
+    public RelationType getOutputDescriptor(Node node)
     {
         Preconditions.checkState(outputDescriptors.containsKey(node), "Output descriptor missing for %s. Broken analysis?", node);
         return outputDescriptors.get(node);
@@ -336,12 +346,12 @@ public class Analysis
         return columns.get(field);
     }
 
-    public void setCreateTableDestination(QualifiedTableName destination)
+    public void setCreateTableDestination(QualifiedObjectName destination)
     {
         this.createTableDestination = Optional.of(destination);
     }
 
-    public Optional<QualifiedTableName> getCreateTableDestination()
+    public Optional<QualifiedObjectName> getCreateTableDestination()
     {
         return createTableDestination;
     }
@@ -356,14 +366,14 @@ public class Analysis
         return createTableProperties;
     }
 
-    public void setInsertTarget(TableHandle target)
+    public void setInsert(Insert insert)
     {
-        this.insertTarget = Optional.of(target);
+        this.insert = Optional.of(insert);
     }
 
-    public Optional<TableHandle> getInsertTarget()
+    public Optional<Insert> getInsert()
     {
-        return insertTarget;
+        return insert;
     }
 
     public void setDelete(Delete delete)
@@ -439,6 +449,30 @@ public class Analysis
             final JoinInPredicates other = (JoinInPredicates) obj;
             return Objects.equals(this.leftInPredicates, other.leftInPredicates) &&
                     Objects.equals(this.rightInPredicates, other.rightInPredicates);
+        }
+    }
+
+    @Immutable
+    public static final class Insert
+    {
+        private final TableHandle target;
+        private final List<ColumnHandle> columns;
+
+        public Insert(TableHandle target, List<ColumnHandle> columns)
+        {
+            this.target = requireNonNull(target, "target is null");
+            this.columns = requireNonNull(columns, "columns is null");
+            checkArgument(columns.size() > 0, "No columns given to insert");
+        }
+
+        public List<ColumnHandle> getColumns()
+        {
+            return columns;
+        }
+
+        public TableHandle getTarget()
+        {
+            return target;
         }
     }
 }

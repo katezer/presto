@@ -15,7 +15,6 @@ package com.facebook.presto.raptor.storage;
 
 import com.facebook.presto.raptor.backup.BackupStore;
 import com.facebook.presto.raptor.metadata.ColumnInfo;
-import com.facebook.presto.raptor.metadata.DatabaseShardManager;
 import com.facebook.presto.raptor.metadata.MetadataDao;
 import com.facebook.presto.raptor.metadata.ShardInfo;
 import com.facebook.presto.raptor.metadata.ShardManager;
@@ -23,7 +22,8 @@ import com.facebook.presto.raptor.metadata.ShardMetadata;
 import com.facebook.presto.spi.HostAddress;
 import com.facebook.presto.spi.Node;
 import com.facebook.presto.spi.NodeManager;
-import com.facebook.presto.spi.TupleDomain;
+import com.facebook.presto.spi.NodeState;
+import com.facebook.presto.spi.predicate.TupleDomain;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import io.airlift.units.Duration;
@@ -41,6 +41,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 
+import static com.facebook.presto.raptor.metadata.TestDatabaseShardManager.createShardManager;
 import static com.facebook.presto.spi.type.BigintType.BIGINT;
 import static com.google.common.io.Files.createTempDir;
 import static io.airlift.testing.FileUtils.deleteRecursively;
@@ -66,7 +67,7 @@ public class TestShardEjector
     {
         dbi = new DBI("jdbc:h2:mem:test" + System.nanoTime());
         dummyHandle = dbi.open();
-        shardManager = new DatabaseShardManager(dbi);
+        shardManager = createShardManager(dbi);
 
         dataDir = createTempDir();
         storageService = new FileStorageService(dataDir);
@@ -119,7 +120,9 @@ public class TestShardEjector
         List<ColumnInfo> columns = ImmutableList.of(new ColumnInfo(1, BIGINT));
 
         shardManager.createTable(tableId, columns);
-        shardManager.commitShards(tableId, columns, shards, Optional.empty());
+
+        long transactionId = shardManager.beginTransaction();
+        shardManager.commitShards(transactionId, tableId, columns, shards, Optional.empty());
 
         for (ShardInfo shard : shards.subList(0, 8)) {
             File file = storageService.getStorageFile(shard.getShardUuid());
@@ -203,7 +206,7 @@ public class TestShardEjector
         }
 
         @Override
-        public Set<Node> getActiveNodes()
+        public Set<Node> getNodes(NodeState state)
         {
             return nodes;
         }

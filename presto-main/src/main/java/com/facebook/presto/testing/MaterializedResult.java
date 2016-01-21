@@ -46,6 +46,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
@@ -62,8 +64,10 @@ import static com.facebook.presto.spi.type.TimestampType.TIMESTAMP;
 import static com.facebook.presto.spi.type.TimestampWithTimeZoneType.TIMESTAMP_WITH_TIME_ZONE;
 import static com.facebook.presto.spi.type.VarbinaryType.VARBINARY;
 import static com.facebook.presto.spi.type.VarcharType.VARCHAR;
+import static com.facebook.presto.util.ImmutableCollectors.toImmutableSet;
 import static com.google.common.base.MoreObjects.toStringHelper;
 import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Preconditions.checkState;
 import static java.util.Objects.requireNonNull;
 
 public class MaterializedResult
@@ -75,18 +79,28 @@ public class MaterializedResult
     private final List<Type> types;
     private final Map<String, String> setSessionProperties;
     private final Set<String> resetSessionProperties;
+    private final Optional<String> updateType;
+    private final OptionalLong updateCount;
 
     public MaterializedResult(List<MaterializedRow> rows, List<? extends Type> types)
     {
-        this(rows, types, ImmutableMap.of(), ImmutableSet.of());
+        this(rows, types, ImmutableMap.of(), ImmutableSet.of(), Optional.empty(), OptionalLong.empty());
     }
 
-    public MaterializedResult(List<MaterializedRow> rows, List<? extends Type> types, Map<String, String> setSessionProperties, Set<String> resetSessionProperties)
+    public MaterializedResult(
+            List<MaterializedRow> rows,
+            List<? extends Type> types,
+            Map<String, String> setSessionProperties,
+            Set<String> resetSessionProperties,
+            Optional<String> updateType,
+            OptionalLong updateCount)
     {
         this.rows = ImmutableList.copyOf(requireNonNull(rows, "rows is null"));
         this.types = ImmutableList.copyOf(requireNonNull(types, "types is null"));
         this.setSessionProperties = ImmutableMap.copyOf(requireNonNull(setSessionProperties, "setSessionProperties is null"));
         this.resetSessionProperties = ImmutableSet.copyOf(requireNonNull(resetSessionProperties, "resetSessionProperties is null"));
+        this.updateType = requireNonNull(updateType, "updateType is null");
+        this.updateCount = requireNonNull(updateCount, "updateCount is null");
     }
 
     public int getRowCount()
@@ -120,6 +134,16 @@ public class MaterializedResult
         return resetSessionProperties;
     }
 
+    public Optional<String> getUpdateType()
+    {
+        return updateType;
+    }
+
+    public OptionalLong getUpdateCount()
+    {
+        return updateCount;
+    }
+
     @Override
     public boolean equals(Object obj)
     {
@@ -133,13 +157,15 @@ public class MaterializedResult
         return Objects.equals(types, o.types) &&
                 Objects.equals(rows, o.rows) &&
                 Objects.equals(setSessionProperties, o.setSessionProperties) &&
-                Objects.equals(resetSessionProperties, o.resetSessionProperties);
+                Objects.equals(resetSessionProperties, o.resetSessionProperties) &&
+                Objects.equals(updateType, o.updateType) &&
+                Objects.equals(updateCount, o.updateCount);
     }
 
     @Override
     public int hashCode()
     {
-        return Objects.hash(rows, types, setSessionProperties, resetSessionProperties);
+        return Objects.hash(rows, types, setSessionProperties, resetSessionProperties, updateType, updateCount);
     }
 
     @Override
@@ -150,7 +176,18 @@ public class MaterializedResult
                 .add("types", types)
                 .add("setSessionProperties", setSessionProperties)
                 .add("resetSessionProperties", resetSessionProperties)
+                .add("updateType", updateType.orElse(null))
+                .add("updateCount", updateCount.isPresent() ? updateCount.getAsLong() : null)
+                .omitNullValues()
                 .toString();
+    }
+
+    public Set<String> getOnlyColumnAsSet()
+    {
+        checkState(types.size() == 1, "result set must have exactly one column");
+        return rows.stream()
+                .map(row -> (String) row.getField(0))
+                .collect(toImmutableSet());
     }
 
     public Page toPage()
@@ -255,7 +292,13 @@ public class MaterializedResult
         for (MaterializedRow row : rows) {
             jdbcRows.add(convertToJdbcTypes(row));
         }
-        return new MaterializedResult(jdbcRows.build(), types, setSessionProperties, resetSessionProperties);
+        return new MaterializedResult(
+                jdbcRows.build(),
+                types,
+                setSessionProperties,
+                resetSessionProperties,
+                updateType,
+                updateCount);
     }
 
     private static MaterializedRow convertToJdbcTypes(MaterializedRow prestoRow)
@@ -362,19 +405,19 @@ public class MaterializedResult
             this.types = ImmutableList.copyOf(types);
         }
 
-        public Builder rows(List<MaterializedRow> rows)
+        public synchronized Builder rows(List<MaterializedRow> rows)
         {
             this.rows.addAll(rows);
             return this;
         }
 
-        public Builder row(Object... values)
+        public synchronized Builder row(Object... values)
         {
             rows.add(new MaterializedRow(DEFAULT_PRECISION, values));
             return this;
         }
 
-        public Builder rows(Object[][] rows)
+        public synchronized Builder rows(Object[][] rows)
         {
             for (Object[] row : rows) {
                 row(row);
@@ -382,7 +425,7 @@ public class MaterializedResult
             return this;
         }
 
-        public Builder pages(Iterable<Page> pages)
+        public synchronized Builder pages(Iterable<Page> pages)
         {
             for (Page page : pages) {
                 this.page(page);
@@ -391,7 +434,7 @@ public class MaterializedResult
             return this;
         }
 
-        public Builder page(Page page)
+        public synchronized Builder page(Page page)
         {
             requireNonNull(page, "page is null");
             checkArgument(page.getChannelCount() == types.size(), "Expected a page with %s columns, but got %s columns", types.size(), page.getChannelCount());
@@ -410,7 +453,7 @@ public class MaterializedResult
             return this;
         }
 
-        public MaterializedResult build()
+        public synchronized MaterializedResult build()
         {
             return new MaterializedResult(rows.build(), types);
         }

@@ -24,14 +24,16 @@ import com.facebook.presto.operator.scalar.ScalarFunctionImplementation;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.RecordCursor;
-import com.facebook.presto.spi.StandardErrorCode;
 import com.facebook.presto.spi.block.Block;
+import com.facebook.presto.spi.block.BlockBuilder;
+import com.facebook.presto.spi.block.BlockBuilderStatus;
 import com.facebook.presto.spi.type.StandardTypes;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.sql.analyzer.AnalysisContext;
 import com.facebook.presto.sql.analyzer.ExpressionAnalyzer;
+import com.facebook.presto.sql.analyzer.RelationType;
+import com.facebook.presto.sql.analyzer.SemanticErrorCode;
 import com.facebook.presto.sql.analyzer.SemanticException;
-import com.facebook.presto.sql.analyzer.TupleDescriptor;
 import com.facebook.presto.sql.planner.optimizations.CanonicalizeExpressions;
 import com.facebook.presto.sql.tree.ArithmeticBinaryExpression;
 import com.facebook.presto.sql.tree.ArithmeticUnaryExpression;
@@ -68,6 +70,7 @@ import com.facebook.presto.sql.tree.SimpleCaseExpression;
 import com.facebook.presto.sql.tree.StringLiteral;
 import com.facebook.presto.sql.tree.SubscriptExpression;
 import com.facebook.presto.sql.tree.WhenClause;
+import com.facebook.presto.type.ArrayType;
 import com.facebook.presto.type.LikeFunctions;
 import com.facebook.presto.util.Failures;
 import com.facebook.presto.util.FastutilSetHelper;
@@ -75,6 +78,7 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Functions;
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import io.airlift.joni.Regex;
@@ -91,19 +95,19 @@ import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import static com.facebook.presto.metadata.FunctionRegistry.canCoerce;
 import static com.facebook.presto.spi.StandardErrorCode.NOT_SUPPORTED;
 import static com.facebook.presto.spi.type.TypeSignature.parseTypeSignature;
+import static com.facebook.presto.spi.type.TypeUtils.writeNativeValue;
 import static com.facebook.presto.sql.analyzer.ExpressionAnalyzer.createConstantAnalyzer;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.EXPRESSION_NOT_CONSTANT;
 import static com.facebook.presto.sql.planner.LiteralInterpreter.toExpression;
 import static com.facebook.presto.sql.planner.LiteralInterpreter.toExpressions;
+import static com.facebook.presto.type.TypeRegistry.canCoerce;
 import static com.facebook.presto.util.ImmutableCollectors.toImmutableList;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.base.Predicates.instanceOf;
 import static com.google.common.base.Verify.verify;
 import static com.google.common.collect.Iterables.any;
-import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Objects.requireNonNull;
 
 public class ExpressionInterpreter
@@ -138,16 +142,14 @@ public class ExpressionInterpreter
         return new ExpressionInterpreter(expression, metadata, session, expressionTypes, true);
     }
 
-    public static Object evaluateConstantExpression(Expression expression, Type expectedType, Metadata metadata, Session session, Set<Expression> columnReferences)
+    public static Object evaluateConstantExpression(Expression expression, Type expectedType, Metadata metadata, Session session)
     {
-        requireNonNull(columnReferences, "columnReferences is null");
-
         ExpressionAnalyzer analyzer = createConstantAnalyzer(metadata, session);
-        analyzer.analyze(expression, new TupleDescriptor(), new AnalysisContext());
+        analyzer.analyze(expression, new RelationType(), new AnalysisContext());
 
         Type actualType = analyzer.getExpressionTypes().get(expression);
         if (!canCoerce(actualType, expectedType)) {
-            throw new PrestoException(StandardErrorCode.INVALID_SESSION_PROPERTY, String.format("Can not set property of type %s to %s",
+            throw new SemanticException(SemanticErrorCode.TYPE_MISMATCH, expression, String.format("Cannot cast type %s to %s",
                     expectedType.getTypeSignature(),
                     actualType.getTypeSignature()));
         }
@@ -155,7 +157,7 @@ public class ExpressionInterpreter
         IdentityHashMap<Expression, Type> coercions = new IdentityHashMap<>();
         coercions.putAll(analyzer.getExpressionCoercions());
         coercions.put(expression, expectedType);
-        return evaluateConstantExpression(expression, coercions, metadata, session, columnReferences);
+        return evaluateConstantExpression(expression, coercions, metadata, session, ImmutableSet.of());
     }
 
     public static Object evaluateConstantExpression(Expression expression, IdentityHashMap<Expression, Type> coercions, Metadata metadata, Session session, Set<Expression> columnReferences)
@@ -163,31 +165,7 @@ public class ExpressionInterpreter
         requireNonNull(columnReferences, "columnReferences is null");
 
         // verify expression is constant
-        expression.accept(new DefaultTraversalVisitor<Void, Void>()
-        {
-            @Override
-            protected Void visitDereferenceExpression(DereferenceExpression node, Void context)
-            {
-                if (columnReferences.contains(node)) {
-                    throw new SemanticException(EXPRESSION_NOT_CONSTANT, expression, "Constant expression cannot contain column references");
-                }
-
-                process(node.getBase(), context);
-                return null;
-            }
-
-            @Override
-            protected Void visitQualifiedNameReference(QualifiedNameReference node, Void context)
-            {
-                throw new SemanticException(EXPRESSION_NOT_CONSTANT, expression, "Constant expression cannot contain column references");
-            }
-
-            @Override
-            protected Void visitInputReference(InputReference node, Void context)
-            {
-                throw new SemanticException(EXPRESSION_NOT_CONSTANT, expression, "Constant expression cannot contain column references");
-            }
-        }, null);
+        new ConstantExpressionVerifierVisitor(columnReferences, expression).process(expression, null);
 
         // add coercions
         Expression rewrite = ExpressionTreeRewriter.rewriteWith(new ExpressionRewriter<Void>()
@@ -214,7 +192,7 @@ public class ExpressionInterpreter
         // The optimization above may have rewritten the expression tree which breaks all the identity maps, so redo the analysis
         // to re-analyze coercions that might be necessary
         ExpressionAnalyzer analyzer = createConstantAnalyzer(metadata, session);
-        analyzer.analyze(canonicalized, new TupleDescriptor(), new AnalysisContext());
+        analyzer.analyze(canonicalized, new RelationType(), new AnalysisContext());
 
         // evaluate the expression
         Object result = expressionInterpreter(canonicalized, metadata, session, analyzer.getExpressionTypes()).evaluate(0);
@@ -249,6 +227,42 @@ public class ExpressionInterpreter
     {
         checkState(optimize, "evaluate(SymbolResolver) not allowed for interpreter");
         return visitor.process(expression, inputs);
+    }
+
+    private static class ConstantExpressionVerifierVisitor
+            extends DefaultTraversalVisitor<Void, Void>
+    {
+        private final Set<Expression> columnReferences;
+        private final Expression expression;
+
+        public ConstantExpressionVerifierVisitor(Set<Expression> columnReferences, Expression expression)
+        {
+            this.columnReferences = columnReferences;
+            this.expression = expression;
+        }
+
+        @Override
+        protected Void visitDereferenceExpression(DereferenceExpression node, Void context)
+        {
+            if (columnReferences.contains(node)) {
+                throw new SemanticException(EXPRESSION_NOT_CONSTANT, expression, "Constant expression cannot contain column references");
+            }
+
+            process(node.getBase(), context);
+            return null;
+        }
+
+        @Override
+        protected Void visitQualifiedNameReference(QualifiedNameReference node, Void context)
+        {
+            throw new SemanticException(EXPRESSION_NOT_CONSTANT, expression, "Constant expression cannot contain column references");
+        }
+
+        @Override
+        protected Void visitInputReference(InputReference node, Void context)
+        {
+            throw new SemanticException(EXPRESSION_NOT_CONSTANT, expression, "Constant expression cannot contain column references");
+        }
     }
 
     @SuppressWarnings("FloatingPointEquality")
@@ -699,20 +713,20 @@ public class ExpressionInterpreter
                 return new NullIfExpression(toExpression(first, firstType), toExpression(second, secondType));
             }
 
-            Type commonType = FunctionRegistry.getCommonSuperType(firstType, secondType).get();
+            Type commonType = metadata.getTypeManager().getCommonSuperType(firstType, secondType).get();
 
             Signature firstCast = metadata.getFunctionRegistry().getCoercion(firstType, commonType);
             Signature secondCast = metadata.getFunctionRegistry().getCoercion(secondType, commonType);
-            MethodHandle firstCastHandle = metadata.getFunctionRegistry().getScalarFunctionImplementation(firstCast).getMethodHandle();
-            MethodHandle secondCastHandle = metadata.getFunctionRegistry().getScalarFunctionImplementation(secondCast).getMethodHandle();
+            ScalarFunctionImplementation firstCastFunction = metadata.getFunctionRegistry().getScalarFunctionImplementation(firstCast);
+            ScalarFunctionImplementation secondCastFunction = metadata.getFunctionRegistry().getScalarFunctionImplementation(secondCast);
 
             // cast(first as <common type>) == cast(second as <common type>)
             boolean equal = (Boolean) invokeOperator(
                     OperatorType.EQUAL,
                     ImmutableList.of(commonType, commonType),
                     ImmutableList.of(
-                            invoke(session, firstCastHandle, ImmutableList.of(first)),
-                            invoke(session, secondCastHandle, ImmutableList.of(second))));
+                            invoke(session, firstCastFunction, ImmutableList.of(first)),
+                            invoke(session, secondCastFunction, ImmutableList.of(second))));
 
             if (equal) {
                 return null;
@@ -807,7 +821,7 @@ public class ExpressionInterpreter
             if (optimize && (!function.isDeterministic() || hasUnresolvedValue(argumentValues))) {
                 return new FunctionCall(node.getName(), node.getWindow(), node.isDistinct(), toExpressions(argumentValues, argumentTypes));
             }
-            return invoke(session, function.getMethodHandle(), argumentValues);
+            return invoke(session, function, argumentValues);
         }
 
         @Override
@@ -857,7 +871,7 @@ public class ExpressionInterpreter
 
             // if pattern is a constant without % or _ replace with a comparison
             if (pattern instanceof Slice && escape == null) {
-                String stringPattern = ((Slice) pattern).toString(UTF_8);
+                String stringPattern = ((Slice) pattern).toStringUtf8();
                 if (!stringPattern.contains("%") && !stringPattern.contains("_")) {
                     return new ComparisonExpression(ComparisonExpression.Type.EQUAL,
                             toExpression(value, expressionTypes.get(node.getValue())),
@@ -924,7 +938,7 @@ public class ExpressionInterpreter
             Signature operator = metadata.getFunctionRegistry().getCoercion(expressionTypes.get(node.getExpression()), type);
 
             try {
-                return invoke(session, metadata.getFunctionRegistry().getScalarFunctionImplementation(operator).getMethodHandle(), ImmutableList.of(value));
+                return invoke(session, metadata.getFunctionRegistry().getScalarFunctionImplementation(operator), ImmutableList.of(value));
             }
             catch (RuntimeException e) {
                 if (node.isSafe()) {
@@ -937,7 +951,18 @@ public class ExpressionInterpreter
         @Override
         protected Object visitArrayConstructor(ArrayConstructor node, Object context)
         {
-            return visitFunctionCall(new FunctionCall(QualifiedName.of(ArrayConstructor.ARRAY_CONSTRUCTOR), node.getValues()), context);
+            Type elementType = ((ArrayType) expressionTypes.get(node)).getElementType();
+            BlockBuilder arrayBlockBuilder = elementType.createBlockBuilder(new BlockBuilderStatus(), node.getValues().size());
+
+            for (Expression expression : node.getValues()) {
+                Object value = process(expression, context);
+                if (value instanceof Expression) {
+                    return visitFunctionCall(new FunctionCall(QualifiedName.of(ArrayConstructor.ARRAY_CONSTRUCTOR), node.getValues()), context);
+                }
+                writeNativeValue(elementType, arrayBlockBuilder, value);
+            }
+
+            return arrayBlockBuilder.build();
         }
 
         @Override
@@ -998,7 +1023,7 @@ public class ExpressionInterpreter
         private Object invokeOperator(OperatorType operatorType, List<? extends Type> argumentTypes, List<Object> argumentValues)
         {
             Signature operatorSignature = metadata.getFunctionRegistry().resolveOperator(operatorType, argumentTypes);
-            return invoke(session, metadata.getFunctionRegistry().getScalarFunctionImplementation(operatorSignature).getMethodHandle(), argumentValues);
+            return invoke(session, metadata.getFunctionRegistry().getScalarFunctionImplementation(operatorSignature), argumentValues);
         }
     }
 
@@ -1024,8 +1049,20 @@ public class ExpressionInterpreter
         }
     }
 
-    public static Object invoke(ConnectorSession session, MethodHandle handle, List<Object> argumentValues)
+    public static Object invoke(ConnectorSession session, ScalarFunctionImplementation function, List<Object> argumentValues)
     {
+        MethodHandle handle = function.getMethodHandle();
+        if (function.getInstanceFactory().isPresent()) {
+            try {
+                handle = handle.bindTo(function.getInstanceFactory().get().invoke());
+            }
+            catch (Throwable throwable) {
+                if (throwable instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+                throw Throwables.propagate(throwable);
+            }
+        }
         if (handle.type().parameterCount() > 0 && handle.type().parameterType(0) == ConnectorSession.class) {
             handle = handle.bindTo(session);
         }

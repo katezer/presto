@@ -23,6 +23,7 @@ import com.facebook.presto.spi.type.FixedWidthType;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.spi.type.TypeManager;
 import com.facebook.presto.spi.type.TypeSignature;
+import com.facebook.presto.spi.type.TypeSignatureParameter;
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import io.airlift.slice.Slice;
@@ -112,7 +113,11 @@ public final class TypeUtils
 
     public static TypeSignature parameterizedTypeName(String base, TypeSignature... argumentNames)
     {
-        return new TypeSignature(base, ImmutableList.copyOf(argumentNames), ImmutableList.of());
+        ImmutableList.Builder<TypeSignatureParameter> parameters = ImmutableList.builder();
+        for (TypeSignature signature : argumentNames) {
+            parameters.add(TypeSignatureParameter.of(signature));
+        }
+        return new TypeSignature(base, parameters.build());
     }
 
     public static int getHashPosition(List<? extends Type> hashTypes, Block[] hashBlocks, int position)
@@ -156,30 +161,6 @@ public final class TypeUtils
         }
         blocks[page.getChannelCount()] = getHashBlock(hashTypes.build(), hashBlocks);
         return new Page(blocks);
-    }
-
-    public static Object castValue(Type type, Block block, int position)
-    {
-        Class<?> javaType = type.getJavaType();
-
-        if (block.isNull(position)) {
-            return null;
-        }
-        else if (javaType == boolean.class) {
-            return type.getBoolean(block, position);
-        }
-        else if (javaType == long.class) {
-            return type.getLong(block, position);
-        }
-        else if (javaType == double.class) {
-            return type.getDouble(block, position);
-        }
-        else if (type.getJavaType() == Slice.class) {
-            return type.getSlice(block, position);
-        }
-        else {
-            return type.getObject(block, position);
-        }
     }
 
     public static void checkElementNotNull(boolean isNull, String errorMsg)

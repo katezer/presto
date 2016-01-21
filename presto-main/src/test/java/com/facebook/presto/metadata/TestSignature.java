@@ -28,7 +28,7 @@ import org.testng.annotations.Test;
 
 import java.util.Map;
 
-import static com.facebook.presto.metadata.FunctionType.SCALAR;
+import static com.facebook.presto.metadata.FunctionKind.SCALAR;
 import static com.facebook.presto.metadata.Signature.comparableTypeParameter;
 import static com.facebook.presto.metadata.Signature.typeParameter;
 import static com.facebook.presto.metadata.Signature.withVariadicBound;
@@ -57,7 +57,7 @@ public class TestSignature
         Signature actual = codec.fromJson(json);
 
         assertEquals(actual.getName(), expected.getName());
-        assertEquals(actual.getType(), expected.getType());
+        assertEquals(actual.getKind(), expected.getKind());
         assertEquals(actual.getReturnType(), expected.getReturnType());
         assertEquals(actual.getArgumentTypes(), expected.getArgumentTypes());
     }
@@ -79,7 +79,7 @@ public class TestSignature
             throws Exception
     {
         TypeManager typeManager = new TypeRegistry();
-        Signature signature = new Signature("foo", SCALAR, ImmutableList.<TypeParameter>of(), "boolean", ImmutableList.of("bigint"), false);
+        Signature signature = new Signature("foo", SCALAR, ImmutableList.<TypeParameterRequirement>of(), "boolean", ImmutableList.of("bigint"), false);
         assertNotNull(signature.bindTypeParameters(ImmutableList.of(BIGINT), true, typeManager));
         assertNull(signature.bindTypeParameters(ImmutableList.of(VARCHAR), true, typeManager));
         assertNull(signature.bindTypeParameters(ImmutableList.of(VARCHAR, BIGINT), true, typeManager));

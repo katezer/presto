@@ -15,7 +15,6 @@ package com.facebook.presto.raptor.storage;
 
 import com.facebook.presto.raptor.metadata.ColumnInfo;
 import com.facebook.presto.raptor.metadata.ColumnStats;
-import com.facebook.presto.raptor.metadata.DatabaseShardManager;
 import com.facebook.presto.raptor.metadata.MetadataDao;
 import com.facebook.presto.raptor.metadata.ShardInfo;
 import com.facebook.presto.raptor.metadata.ShardManager;
@@ -40,10 +39,10 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
+import static com.facebook.presto.raptor.metadata.TestDatabaseShardManager.createShardManager;
 import static com.facebook.presto.raptor.metadata.TestDatabaseShardManager.shardInfo;
-import static com.facebook.presto.raptor.storage.TestOrcStorageManager.createOrcStorageManager;
-import static com.facebook.presto.raptor.storage.TestShardRecovery.createShardRecoveryManager;
 import static com.facebook.presto.spi.type.BigintType.BIGINT;
+import static com.google.common.reflect.Reflection.newProxy;
 import static io.airlift.units.DataSize.Unit.MEGABYTE;
 import static java.util.stream.Collectors.toSet;
 import static org.testng.Assert.assertEquals;
@@ -51,7 +50,8 @@ import static org.testng.Assert.assertEquals;
 @Test(singleThreaded = true)
 public class TestShardCompactionDiscovery
 {
-    private static final ReaderAttributes readerAttributes = new ReaderAttributes(new DataSize(1, MEGABYTE), new DataSize(1, MEGABYTE), new DataSize(1, MEGABYTE));
+    private static final DataSize ONE_MEGABYTE = new DataSize(1, MEGABYTE);
+    private static final ReaderAttributes READER_ATTRIBUTES = new ReaderAttributes(ONE_MEGABYTE, ONE_MEGABYTE, ONE_MEGABYTE);
 
     private IDBI dbi;
     private Handle dummyHandle;
@@ -64,7 +64,7 @@ public class TestShardCompactionDiscovery
         dbi = new DBI("jdbc:h2:mem:test" + System.nanoTime());
         dummyHandle = dbi.open();
         dataDir = Files.createTempDir();
-        shardManager = new DatabaseShardManager(dbi);
+        shardManager = createShardManager(dbi);
     }
 
     @AfterMethod
@@ -88,7 +88,8 @@ public class TestShardCompactionDiscovery
                 .add(shardInfo(UUID.randomUUID(), "node1"))
                 .add(shardInfo(UUID.randomUUID(), "node1"))
                 .build();
-        shardManager.commitShards(tableId, columns, nonTimeRangeShards, Optional.empty());
+        long transactionId = shardManager.beginTransaction();
+        shardManager.commitShards(transactionId, tableId, columns, nonTimeRangeShards, Optional.empty());
 
         Set<ShardInfo> timeRangeShards = ImmutableSet.<ShardInfo>builder()
                 .add(shardInfo(
@@ -104,18 +105,19 @@ public class TestShardCompactionDiscovery
                         "node1",
                         ImmutableList.of(new ColumnStats(1, 1, 10), new ColumnStats(2, 1, 10))))
                 .build();
-        shardManager.commitShards(tableId, columns, timeRangeShards, Optional.empty());
+        transactionId = shardManager.beginTransaction();
+        shardManager.commitShards(transactionId, tableId, columns, timeRangeShards, Optional.empty());
 
-        StorageService storageService = new FileStorageService(dataDir);
-        ShardRecoveryManager recoveryManager = createShardRecoveryManager(storageService, Optional.empty(), shardManager);
-        StorageManager storageManager = createOrcStorageManager(storageService, Optional.empty(), recoveryManager);
+        StorageManager storageManager = newProxy(StorageManager.class, (proxy, method, args) -> {
+            throw new UnsupportedOperationException();
+        });
         ShardCompactionManager shardCompactionManager = new ShardCompactionManager(
                 dbi,
                 "node1",
                 shardManager,
-                new ShardCompactor(storageManager, readerAttributes),
+                new ShardCompactor(storageManager, READER_ATTRIBUTES),
                 new Duration(1, TimeUnit.HOURS),
-                new DataSize(1, DataSize.Unit.MEGABYTE),
+                ONE_MEGABYTE,
                 100,
                 10,
                 true);

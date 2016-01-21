@@ -15,6 +15,8 @@ package com.facebook.presto.operator;
 
 import com.facebook.presto.Session;
 import com.facebook.presto.execution.TaskId;
+import com.facebook.presto.sql.planner.plan.PlanNodeId;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.util.concurrent.ListenableFuture;
@@ -92,12 +94,12 @@ public class DriverContext
         return pipelineContext.getTaskId();
     }
 
-    public OperatorContext addOperatorContext(int operatorId, String operatorType)
+    public OperatorContext addOperatorContext(int operatorId, PlanNodeId planNodeId, String operatorType)
     {
-        return addOperatorContext(operatorId, operatorType, Long.MAX_VALUE);
+        return addOperatorContext(operatorId, planNodeId, operatorType, Long.MAX_VALUE);
     }
 
-    public OperatorContext addOperatorContext(int operatorId, String operatorType, long maxMemoryReservation)
+    public OperatorContext addOperatorContext(int operatorId, PlanNodeId planNodeId, String operatorType, long maxMemoryReservation)
     {
         checkArgument(operatorId >= 0, "operatorId is negative");
 
@@ -105,7 +107,7 @@ public class DriverContext
             checkArgument(operatorId != operatorContext.getOperatorId(), "A context already exists for operatorId %s", operatorId);
         }
 
-        OperatorContext operatorContext = new OperatorContext(operatorId, operatorType, this, executor, maxMemoryReservation);
+        OperatorContext operatorContext = new OperatorContext(operatorId, planNodeId, operatorType, this, executor, maxMemoryReservation);
         operatorContexts.add(operatorContext);
         return operatorContext;
     }
@@ -233,6 +235,12 @@ public class DriverContext
         checkArgument(bytes <= systemMemoryReservation.get(), "tried to free more memory than is reserved");
         pipelineContext.freeSystemMemory(bytes);
         systemMemoryReservation.getAndAdd(-bytes);
+    }
+
+    @VisibleForTesting
+    public long getSystemMemoryUsage()
+    {
+        return systemMemoryReservation.get();
     }
 
     public void moreMemoryAvailable()

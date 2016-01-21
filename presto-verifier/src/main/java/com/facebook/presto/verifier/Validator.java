@@ -14,6 +14,7 @@
 package com.facebook.presto.verifier;
 
 import com.facebook.presto.jdbc.PrestoConnection;
+import com.facebook.presto.jdbc.PrestoResultSet;
 import com.facebook.presto.spi.type.SqlVarbinary;
 import com.facebook.presto.verifier.Validator.ChangedRow.Changed;
 import com.google.common.base.Joiner;
@@ -49,7 +50,6 @@ import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
-import java.util.regex.Pattern;
 
 import static com.facebook.presto.verifier.QueryResult.State;
 import static com.google.common.base.Preconditions.checkArgument;
@@ -72,6 +72,7 @@ public class Validator
     private final Duration testTimeout;
     private final int maxRowCount;
     private final boolean checkCorrectness;
+    private final boolean checkDeterministic;
     private final boolean verboseResultsComparison;
     private final QueryPair queryPair;
     private final boolean explainOnly;
@@ -83,32 +84,40 @@ public class Validator
     private QueryResult controlResult;
     private QueryResult testResult;
 
+    private final List<QueryResult> controlPreQueryResults = new ArrayList<>();
+    private final List<QueryResult> controlPostQueryResults = new ArrayList<>();
+    private final List<QueryResult> testPreQueryResults = new ArrayList<>();
+    private final List<QueryResult> testPostQueryResults = new ArrayList<>();
+
     private boolean deterministic = true;
 
-    public Validator(VerifierConfig config, QueryPair queryPair)
+    public Validator(
+            String controlGateway,
+            String testGateway,
+            Duration controlTimeout,
+            Duration testTimeout,
+            int maxRowCount,
+            boolean explainOnly,
+            int precision,
+            boolean checkCorrectness,
+            boolean checkDeterministic,
+            boolean verboseResultsComparison,
+            QueryPair queryPair)
     {
-        requireNonNull(config, "config is null");
         this.testUsername = requireNonNull(queryPair.getTest().getUsername(), "test username is null");
         this.controlUsername = requireNonNull(queryPair.getControl().getUsername(), "control username is null");
         this.testPassword = queryPair.getTest().getPassword();
         this.controlPassword = queryPair.getControl().getPassword();
-        this.controlGateway = requireNonNull(config.getControlGateway(), "controlGateway is null");
-        this.testGateway = requireNonNull(config.getTestGateway(), "testGateway is null");
-        this.controlTimeout = config.getControlTimeout();
-        this.testTimeout = config.getTestTimeout();
-        this.maxRowCount = config.getMaxRowCount();
-        this.explainOnly = config.isExplainOnly();
-        this.precision = config.getDoublePrecision();
-        // Check if either the control query or the test query matches the regex
-        if (Pattern.matches(config.getSkipCorrectnessRegex(), queryPair.getTest().getQuery()) ||
-                Pattern.matches(config.getSkipCorrectnessRegex(), queryPair.getControl().getQuery())) {
-            // If so disable correctness checking
-            this.checkCorrectness = false;
-        }
-        else {
-            this.checkCorrectness = config.isCheckCorrectnessEnabled();
-        }
-        this.verboseResultsComparison = config.isVerboseResultsComparison();
+        this.controlGateway = requireNonNull(controlGateway, "controlGateway is null");
+        this.testGateway = requireNonNull(testGateway, "testGateway is null");
+        this.controlTimeout = controlTimeout;
+        this.testTimeout = testTimeout;
+        this.maxRowCount = maxRowCount;
+        this.explainOnly = explainOnly;
+        this.precision = precision;
+        this.checkCorrectness = checkCorrectness;
+        this.checkDeterministic = checkDeterministic;
+        this.verboseResultsComparison = verboseResultsComparison;
 
         this.queryPair = requireNonNull(queryPair, "queryPair is null");
         // Test and Control always have the same session properties.
@@ -188,12 +197,12 @@ public class Validator
 
         // query has too many rows. Consider blacklisting.
         if (controlResult.getState() == State.TOO_MANY_ROWS) {
-            testResult = new QueryResult(State.INVALID, null, null, ImmutableList.<List<Object>>of());
+            testResult = new QueryResult(State.INVALID, null, null, null, ImmutableList.<List<Object>>of());
             return false;
         }
         // query failed in the control
         if (controlResult.getState() != State.SUCCESS) {
-            testResult = new QueryResult(State.INVALID, null, null, ImmutableList.<List<Object>>of());
+            testResult = new QueryResult(State.INVALID, null, null, null, ImmutableList.<List<Object>>of());
             return true;
         }
 
@@ -207,31 +216,39 @@ public class Validator
             return true;
         }
 
-        return resultsMatch(controlResult, testResult, precision) || checkForDeterministicAndRerunTestQueriesIfNeeded();
+        boolean matches = resultsMatch(controlResult, testResult, precision);
+        if (!matches && checkDeterministic) {
+            return checkForDeterministicAndRerunTestQueriesIfNeeded();
+        }
+        return matches;
     }
 
-    private QueryResult tearDown(Query query, Function<String, QueryResult> executor)
+    private QueryResult tearDown(Query query, List<QueryResult> postQueryResults, Function<String, QueryResult> executor)
     {
+        postQueryResults.clear();
         for (String postqueryString : query.getPostQueries()) {
             QueryResult queryResult = executor.apply(postqueryString);
+            postQueryResults.add(queryResult);
             if (queryResult.getState() != State.SUCCESS) {
-                return new QueryResult(State.FAILED_TO_TEARDOWN, queryResult.getException(), queryResult.getDuration(), ImmutableList.<List<Object>>of());
+                return new QueryResult(State.FAILED_TO_TEARDOWN, queryResult.getException(), queryResult.getWallTime(), queryResult.getCpuTime(), ImmutableList.<List<Object>>of());
             }
         }
 
-        return new QueryResult(State.SUCCESS, null, null, ImmutableList.of());
+        return new QueryResult(State.SUCCESS, null, null, null, ImmutableList.of());
     }
 
-    private QueryResult setup(Query query, Function<String, QueryResult> executor)
+    private QueryResult setup(Query query, List<QueryResult> preQueryResults, Function<String, QueryResult> executor)
     {
+        preQueryResults.clear();
         for (String prequeryString : query.getPreQueries()) {
             QueryResult queryResult = executor.apply(prequeryString);
+            preQueryResults.add(queryResult);
             if (queryResult.getState() != State.SUCCESS) {
-                return new QueryResult(State.FAILED_TO_SETUP, queryResult.getException(), queryResult.getDuration(), ImmutableList.<List<Object>>of());
+                return new QueryResult(State.FAILED_TO_SETUP, queryResult.getException(), queryResult.getWallTime(), queryResult.getCpuTime(), ImmutableList.<List<Object>>of());
             }
         }
 
-        return new QueryResult(State.SUCCESS, null, null, ImmutableList.of());
+        return new QueryResult(State.SUCCESS, null, null, null, ImmutableList.of());
     }
 
     private boolean checkForDeterministicAndRerunTestQueriesIfNeeded()
@@ -268,10 +285,10 @@ public class Validator
     private QueryResult executeQueryTest()
     {
         Query query = queryPair.getTest();
-        QueryResult queryResult = new QueryResult(State.INVALID, null, null, ImmutableList.<List<Object>>of());
+        QueryResult queryResult = new QueryResult(State.INVALID, null, null, null, ImmutableList.<List<Object>>of());
         try {
             // startup
-            queryResult = setup(query, testPrequery -> executeQuery(testGateway, testUsername, testPassword, queryPair.getTest(), testPrequery, testTimeout, sessionProperties));
+            queryResult = setup(query, testPreQueryResults, testPrequery -> executeQuery(testGateway, testUsername, testPassword, queryPair.getTest(), testPrequery, testTimeout, sessionProperties));
 
             // if startup is successful -> execute query
             if (queryResult.getState() == State.SUCCESS) {
@@ -280,7 +297,7 @@ public class Validator
         }
         finally {
             // teardown no matter what
-            QueryResult tearDownResult = tearDown(query, testPostquery -> executeQuery(testGateway, testUsername, testPassword, queryPair.getTest(), testPostquery, testTimeout, sessionProperties));
+            QueryResult tearDownResult = tearDown(query, testPostQueryResults, testPostquery -> executeQuery(testGateway, testUsername, testPassword, queryPair.getTest(), testPostquery, testTimeout, sessionProperties));
 
             // if teardown is not successful the query fails
             queryResult = tearDownResult.getState() == State.SUCCESS ? queryResult : tearDownResult;
@@ -291,10 +308,10 @@ public class Validator
     private QueryResult executeQueryControl()
     {
         Query query = queryPair.getControl();
-        QueryResult queryResult = new QueryResult(State.INVALID, null, null, ImmutableList.<List<Object>>of());
+        QueryResult queryResult = new QueryResult(State.INVALID, null, null, null, ImmutableList.<List<Object>>of());
         try {
             // startup
-            queryResult = setup(query, controlPrequery -> executeQuery(controlGateway, controlUsername, controlPassword, queryPair.getControl(), controlPrequery, controlTimeout, sessionProperties));
+            queryResult = setup(query, controlPreQueryResults, controlPrequery -> executeQuery(controlGateway, controlUsername, controlPassword, queryPair.getControl(), controlPrequery, controlTimeout, sessionProperties));
 
             // if startup is successful -> execute query
             if (queryResult.getState() == State.SUCCESS) {
@@ -303,7 +320,7 @@ public class Validator
         }
         finally {
             // teardown no matter what
-            QueryResult tearDownResult = tearDown(query, controlPostquery -> executeQuery(controlGateway, controlUsername, controlPassword, queryPair.getControl(), controlPostquery, controlTimeout, sessionProperties));
+            QueryResult tearDownResult = tearDown(query, controlPostQueryResults, controlPostquery -> executeQuery(controlGateway, controlUsername, controlPassword, queryPair.getControl(), controlPostquery, controlTimeout, sessionProperties));
 
             // if teardown is not successful the query fails
             queryResult = tearDownResult.getState() == State.SUCCESS ? queryResult : tearDownResult;
@@ -326,6 +343,35 @@ public class Validator
         return testResult;
     }
 
+    public List<QueryResult> getControlPreQueryResults()
+    {
+        return controlPreQueryResults;
+    }
+
+    public List<QueryResult> getControlPostQueryResults()
+    {
+        return controlPostQueryResults;
+    }
+
+    public List<QueryResult> getTestPreQueryResults()
+    {
+        return testPreQueryResults;
+    }
+
+    public List<QueryResult> getTestPostQueryResults()
+    {
+        return testPostQueryResults;
+    }
+
+    private Duration getCpuTime(ResultSet resultSet)
+            throws SQLException
+    {
+        if (resultSet.isWrapperFor(PrestoResultSet.class)) {
+            return new Duration(resultSet.unwrap(PrestoResultSet.class).getStats().getCpuTimeMillis(), TimeUnit.MILLISECONDS);
+        }
+        return null;
+    }
+
     private QueryResult executeQuery(String url, String username, String password, Query query, String sql, Duration timeout, Map<String, String> sessionProperties)
     {
         try (Connection connection = DriverManager.getConnection(url, username, password)) {
@@ -342,13 +388,21 @@ public class Validator
                 if (explainOnly) {
                     sql = "EXPLAIN " + sql;
                 }
-                try (final ResultSet resultSet = limitedStatement.executeQuery(sql)) {
-                    List<List<Object>> results = limiter.callWithTimeout(getResultSetConverter(resultSet), timeout.toMillis() - stopwatch.elapsed(TimeUnit.MILLISECONDS), TimeUnit.MILLISECONDS, true);
-                    return new QueryResult(State.SUCCESS, null, nanosSince(start), results);
+                try {
+                    if (limitedStatement.execute(sql)) {
+                        List<List<Object>> results = limiter.callWithTimeout(
+                                getResultSetConverter(limitedStatement.getResultSet()),
+                                timeout.toMillis() - stopwatch.elapsed(TimeUnit.MILLISECONDS),
+                                TimeUnit.MILLISECONDS, true);
+                        return new QueryResult(State.SUCCESS, null, nanosSince(start), getCpuTime(limitedStatement.getResultSet()), results);
+                    }
+                    else {
+                        return new QueryResult(State.SUCCESS, null, nanosSince(start), null, null);
+                    }
                 }
                 catch (AssertionError e) {
                     if (e.getMessage().startsWith("unimplemented type:")) {
-                        return new QueryResult(State.INVALID, null, null, ImmutableList.<List<Object>>of());
+                        return new QueryResult(State.INVALID, null, null, null, ImmutableList.<List<Object>>of());
                     }
                     throw e;
                 }
@@ -356,7 +410,7 @@ public class Validator
                     throw e;
                 }
                 catch (UncheckedTimeoutException e) {
-                    return new QueryResult(State.TIMEOUT, null, null, ImmutableList.<List<Object>>of());
+                    return new QueryResult(State.TIMEOUT, null, null, null, ImmutableList.<List<Object>>of());
                 }
                 catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -374,10 +428,10 @@ public class Validator
                 exception = (Exception) e.getCause();
             }
             State state = isPrestoQueryInvalid(e) ? State.INVALID : State.FAILED;
-            return new QueryResult(state, exception, null, null);
+            return new QueryResult(state, exception, null, null, null);
         }
         catch (VerifierException e) {
-            return new QueryResult(State.TOO_MANY_ROWS, e, null, null);
+            return new QueryResult(State.TOO_MANY_ROWS, e, null, null, null);
         }
     }
 

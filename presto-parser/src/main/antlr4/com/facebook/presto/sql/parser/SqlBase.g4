@@ -37,7 +37,7 @@ statement
         '(' tableElement (',' tableElement)* ')'
         (WITH tableProperties)?                                        #createTable
     | DROP TABLE (IF EXISTS)? qualifiedName                            #dropTable
-    | INSERT INTO qualifiedName query                                  #insertInto
+    | INSERT INTO qualifiedName columnAliases? query                   #insertInto
     | DELETE FROM qualifiedName (WHERE booleanExpression)?             #delete
     | ALTER TABLE from=qualifiedName RENAME TO to=qualifiedName        #renameTable
     | ALTER TABLE tableName=qualifiedName
@@ -46,6 +46,7 @@ statement
         ADD COLUMN column=tableElement                                 #addColumn
     | CREATE (OR REPLACE)? VIEW qualifiedName AS query                 #createView
     | DROP VIEW (IF EXISTS)? qualifiedName                             #dropView
+    | CALL qualifiedName '(' (callArgument (',' callArgument)*)? ')'   #call
     | EXPLAIN ('(' explainOption (',' explainOption)* ')')? statement  #explain
     | SHOW TABLES ((FROM | IN) qualifiedName)? (LIKE pattern=STRING)?  #showTables
     | SHOW SCHEMAS ((FROM | IN) identifier)?                           #showSchemas
@@ -57,6 +58,9 @@ statement
     | SHOW SESSION                                                     #showSession
     | SET SESSION qualifiedName EQ expression                          #setSession
     | RESET SESSION qualifiedName                                      #resetSession
+    | START TRANSACTION (transactionMode (',' transactionMode)*)?      #startTransaction
+    | COMMIT WORK?                                                     #commit
+    | ROLLBACK WORK?                                                   #rollback
     | SHOW PARTITIONS (FROM | IN) qualifiedName
         (WHERE booleanExpression)?
         (ORDER BY sortItem (',' sortItem)*)?
@@ -111,8 +115,25 @@ querySpecification
     : SELECT setQuantifier? selectItem (',' selectItem)*
       (FROM relation (',' relation)*)?
       (WHERE where=booleanExpression)?
-      (GROUP BY groupBy+=expression (',' groupBy+=expression)*)?
+      (GROUP BY groupingElement (',' groupingElement)*)?
       (HAVING having=booleanExpression)?
+    ;
+
+groupingElement
+    : groupingExpressions                                               #singleGroupingSet
+    | ROLLUP '(' (qualifiedName (',' qualifiedName)*)? ')'              #rollup
+    | CUBE '(' (qualifiedName (',' qualifiedName)*)? ')'                #cube
+    | GROUPING SETS '(' groupingSet (',' groupingSet)* ')'              #multipleGroupingSets
+    ;
+
+groupingExpressions
+    : '(' (expression (',' expression)*)? ')'
+    | expression
+    ;
+
+groupingSet
+    : '(' (qualifiedName (',' qualifiedName)*)? ')'
+    | qualifiedName
     ;
 
 namedQuery
@@ -225,10 +246,14 @@ primaryExpression
     | number                                                                         #numericLiteral
     | booleanValue                                                                   #booleanLiteral
     | STRING                                                                         #stringLiteral
+    | BINARY_LITERAL                                                                 #binaryLiteral
+    | POSITION '(' valueExpression IN valueExpression ')'                            #position
     | '(' expression (',' expression)+ ')'                                           #rowConstructor
     | ROW '(' expression (',' expression)* ')'                                       #rowConstructor
     | qualifiedName '(' ASTERISK ')' over?                                           #functionCall
     | qualifiedName '(' (setQuantifier? expression (',' expression)*)? ')' over?     #functionCall
+    | identifier '->' expression                                                     #lambda
+    | '(' identifier (',' identifier)* ')' '->' expression                           #lambda
     | '(' query ')'                                                                  #subqueryExpression
     | CASE valueExpression whenClause+ (ELSE elseExpression=expression)? END         #simpleCase
     | CASE whenClause+ (ELSE elseExpression=expression)? END                         #searchedCase
@@ -246,7 +271,6 @@ primaryExpression
     | SUBSTRING '(' valueExpression FROM valueExpression (FOR valueExpression)? ')'  #substring
     | NORMALIZE '(' valueExpression (',' normalForm)? ')'                            #normalize
     | EXTRACT '(' identifier FROM valueExpression ')'                                #extract
-    | POSITION '(' valueExpression IN valueExpression ')'                            #position
     | '(' expression ')'                                                             #parenthesizedExpression
     ;
 
@@ -275,10 +299,14 @@ type
     : type ARRAY
     | ARRAY '<' type '>'
     | MAP '<' type ',' type '>'
-    | simpleType
+    | baseType ('(' typeParameter (',' typeParameter)* ')')?
     ;
 
-simpleType
+typeParameter
+    : INTEGER_VALUE | type
+    ;
+
+baseType
     : TIME_WITH_TIME_ZONE
     | TIMESTAMP_WITH_TIME_ZONE
     | identifier
@@ -316,6 +344,23 @@ explainOption
     | TYPE value=(LOGICAL | DISTRIBUTED)     #explainType
     ;
 
+transactionMode
+    : ISOLATION LEVEL levelOfIsolation    #isolationLevel
+    | READ accessMode=(ONLY | WRITE)      #transactionAccessMode
+    ;
+
+levelOfIsolation
+    : READ UNCOMMITTED                    #readUncommitted
+    | READ COMMITTED                      #readCommitted
+    | REPEATABLE READ                     #repeatableRead
+    | SERIALIZABLE                        #serializable
+    ;
+
+callArgument
+    : expression                    #positionalArgument
+    | identifier '=>' expression    #namedArgument
+    ;
+
 qualifiedName
     : identifier ('.' identifier)*
     ;
@@ -340,7 +385,7 @@ number
 nonReserved
     : SHOW | TABLES | COLUMNS | COLUMN | PARTITIONS | FUNCTIONS | SCHEMAS | CATALOGS | SESSION
     | ADD
-    | OVER | PARTITION | RANGE | ROWS | PRECEDING | FOLLOWING | CURRENT | ROW | MAP
+    | OVER | PARTITION | RANGE | ROWS | PRECEDING | FOLLOWING | CURRENT | ROW | MAP | ARRAY
     | DATE | TIME | TIMESTAMP | INTERVAL | ZONE
     | YEAR | MONTH | DAY | HOUR | MINUTE | SECOND
     | EXPLAIN | FORMAT | TYPE | TEXT | GRAPHVIZ | LOGICAL | DISTRIBUTED
@@ -352,6 +397,9 @@ nonReserved
     | normalForm
     | POSITION
     | NO | DATA
+    | START | TRANSACTION | COMMIT | ROLLBACK | WORK | ISOLATION | LEVEL
+    | SERIALIZABLE | REPEATABLE | COMMITTED | UNCOMMITTED | READ | WRITE | ONLY
+    | CALL
     ;
 
 normalForm
@@ -369,6 +417,10 @@ DISTINCT: 'DISTINCT';
 WHERE: 'WHERE';
 GROUP: 'GROUP';
 BY: 'BY';
+GROUPING: 'GROUPING';
+SETS: 'SETS';
+CUBE: 'CUBE';
+ROLLUP: 'ROLLUP';
 ORDER: 'ORDER';
 HAVING: 'HAVING';
 LIMIT: 'LIMIT';
@@ -488,6 +540,21 @@ SET: 'SET';
 RESET: 'RESET';
 SESSION: 'SESSION';
 DATA: 'DATA';
+START: 'START';
+TRANSACTION: 'TRANSACTION';
+COMMIT: 'COMMIT';
+ROLLBACK: 'ROLLBACK';
+WORK: 'WORK';
+ISOLATION: 'ISOLATION';
+LEVEL: 'LEVEL';
+SERIALIZABLE: 'SERIALIZABLE';
+REPEATABLE: 'REPEATABLE';
+COMMITTED: 'COMMITTED';
+UNCOMMITTED: 'UNCOMMITTED';
+READ: 'READ';
+WRITE: 'WRITE';
+ONLY: 'ONLY';
+CALL: 'CALL';
 
 NORMALIZE: 'NORMALIZE';
 NFD : 'NFD';
@@ -515,6 +582,13 @@ CONCAT: '||';
 
 STRING
     : '\'' ( ~'\'' | '\'\'' )* '\''
+    ;
+
+// Note: we allow any character inside the binary literal and validate
+// its a correct literal when the AST is being constructed. This
+// allows us to provide more meaningful error messages to the user
+BINARY_LITERAL
+    :  'X\'' (~'\'')* '\''
     ;
 
 INTEGER_VALUE

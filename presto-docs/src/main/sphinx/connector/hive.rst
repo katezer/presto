@@ -63,6 +63,10 @@ Only specify additional configuration files if absolutely necessary.
 We also recommend reducing the configuration files to have the minimum
 set of required properties, as additional properties may cause problems.
 
+The configuration files must exist on all Presto nodes. If you are
+referencing existing Hadoop config files, make sure to copy them to
+any Presto nodes that are not running Hadoop.
+
 Configuration Properties
 ------------------------
 
@@ -99,6 +103,8 @@ Property Name                                      Description                  
 ``hive.immutable-partitions``                      Can new data be inserted into existing partitions?           ``false``
 
 ``hive.max-partitions-per-writers``                Maximum number of partitions per writer.                     100
+
+``hive.s3.sse.enabled``                            Enable S3 server-side encryption.                            ``false``
 ================================================== ============================================================ ==========
 
 Querying Hive Tables

@@ -21,6 +21,8 @@ import com.facebook.presto.metadata.OperatorType;
 import com.facebook.presto.metadata.Signature;
 import com.facebook.presto.security.AccessControl;
 import com.facebook.presto.security.DenyAllAccessControl;
+import com.facebook.presto.spi.PrestoException;
+import com.facebook.presto.spi.StandardErrorCode;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.spi.type.TypeManager;
 import com.facebook.presto.spi.type.TypeSignature;
@@ -30,14 +32,13 @@ import com.facebook.presto.sql.planner.Symbol;
 import com.facebook.presto.sql.tree.ArithmeticBinaryExpression;
 import com.facebook.presto.sql.tree.ArithmeticUnaryExpression;
 import com.facebook.presto.sql.tree.ArrayConstructor;
-import com.facebook.presto.sql.tree.AstVisitor;
 import com.facebook.presto.sql.tree.BetweenPredicate;
+import com.facebook.presto.sql.tree.BinaryLiteral;
 import com.facebook.presto.sql.tree.BooleanLiteral;
 import com.facebook.presto.sql.tree.Cast;
 import com.facebook.presto.sql.tree.CoalesceExpression;
 import com.facebook.presto.sql.tree.ComparisonExpression;
 import com.facebook.presto.sql.tree.CurrentTime;
-import com.facebook.presto.sql.tree.DefaultTraversalVisitor;
 import com.facebook.presto.sql.tree.DereferenceExpression;
 import com.facebook.presto.sql.tree.DoubleLiteral;
 import com.facebook.presto.sql.tree.Expression;
@@ -64,6 +65,7 @@ import com.facebook.presto.sql.tree.Row;
 import com.facebook.presto.sql.tree.SearchedCaseExpression;
 import com.facebook.presto.sql.tree.SimpleCaseExpression;
 import com.facebook.presto.sql.tree.SortItem;
+import com.facebook.presto.sql.tree.StackableAstVisitor;
 import com.facebook.presto.sql.tree.StringLiteral;
 import com.facebook.presto.sql.tree.SubqueryExpression;
 import com.facebook.presto.sql.tree.SubscriptExpression;
@@ -87,8 +89,6 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 
-import static com.facebook.presto.metadata.FunctionRegistry.canCoerce;
-import static com.facebook.presto.metadata.FunctionRegistry.getCommonSuperType;
 import static com.facebook.presto.metadata.OperatorType.SUBSCRIPT;
 import static com.facebook.presto.spi.type.BigintType.BIGINT;
 import static com.facebook.presto.spi.type.BooleanType.BOOLEAN;
@@ -101,12 +101,13 @@ import static com.facebook.presto.spi.type.TimeWithTimeZoneType.TIME_WITH_TIME_Z
 import static com.facebook.presto.spi.type.TimestampType.TIMESTAMP;
 import static com.facebook.presto.spi.type.TimestampWithTimeZoneType.TIMESTAMP_WITH_TIME_ZONE;
 import static com.facebook.presto.spi.type.TypeSignature.parseTypeSignature;
+import static com.facebook.presto.spi.type.VarbinaryType.VARBINARY;
 import static com.facebook.presto.spi.type.VarcharType.VARCHAR;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.AMBIGUOUS_ATTRIBUTE;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.EXPRESSION_NOT_CONSTANT;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.INVALID_LITERAL;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.MISSING_ATTRIBUTE;
-import static com.facebook.presto.sql.analyzer.SemanticErrorCode.MULTIPLE_FIELDS_FROM_SCALAR_SUBQUERY;
+import static com.facebook.presto.sql.analyzer.SemanticErrorCode.MULTIPLE_FIELDS_FROM_SUBQUERY;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.NOT_SUPPORTED;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.TYPE_MISMATCH;
 import static com.facebook.presto.sql.tree.Extract.Field.TIMEZONE_HOUR;
@@ -114,6 +115,8 @@ import static com.facebook.presto.sql.tree.Extract.Field.TIMEZONE_MINUTE;
 import static com.facebook.presto.type.ArrayParametricType.ARRAY;
 import static com.facebook.presto.type.JsonType.JSON;
 import static com.facebook.presto.type.RowType.RowField;
+import static com.facebook.presto.type.TypeRegistry.canCoerce;
+import static com.facebook.presto.type.TypeRegistry.getCommonSuperTypeSignature;
 import static com.facebook.presto.type.UnknownType.UNKNOWN;
 import static com.facebook.presto.util.DateTimeUtils.parseTimestampLiteral;
 import static com.facebook.presto.util.DateTimeUtils.timeHasTimeZone;
@@ -132,6 +135,7 @@ public class ExpressionAnalyzer
     private final IdentityHashMap<FunctionCall, Signature> resolvedFunctions = new IdentityHashMap<>();
     private final IdentityHashMap<Expression, Integer> resolvedNames = new IdentityHashMap<>();
     private final IdentityHashMap<Expression, Type> expressionTypes = new IdentityHashMap<>();
+    private final Set<SubqueryExpression> scalarSubqueries = newIdentityHashSet();
     private final IdentityHashMap<Expression, Type> expressionCoercions = new IdentityHashMap<>();
     private final Set<InPredicate> subqueryInPredicates = newIdentityHashSet();
     private final Session session;
@@ -178,52 +182,30 @@ public class ExpressionAnalyzer
      * @param tupleDescriptor the tuple descriptor to use to resolve QualifiedNames
      * @param context the namespace context of the surrounding query
      */
-    public Type analyze(Expression expression, TupleDescriptor tupleDescriptor, AnalysisContext context)
+    public Type analyze(Expression expression, RelationType tupleDescriptor, AnalysisContext context)
     {
-        ScalarSubqueryDetector scalarSubqueryDetector = new ScalarSubqueryDetector();
-        expression.accept(scalarSubqueryDetector, null);
-
         Visitor visitor = new Visitor(tupleDescriptor);
-        return expression.accept(visitor, context);
+        return visitor.process(expression, new StackableAstVisitor.StackableAstVisitorContext<>(context));
     }
 
-    private static class ScalarSubqueryDetector
-            extends DefaultTraversalVisitor<Void, Void>
+    public Set<SubqueryExpression> getScalarSubqueries()
     {
-        @Override
-        protected Void visitInPredicate(InPredicate node, Void context)
-        {
-            Expression valueList = node.getValueList();
-            if (valueList instanceof SubqueryExpression) {
-                process(node.getValue(), context);
-                super.visitSubqueryExpression((SubqueryExpression) valueList, context);
-            }
-            else {
-                super.visitInPredicate(node, context);
-            }
-            return null;
-        }
-
-        @Override
-        protected Void visitSubqueryExpression(SubqueryExpression node, Void context)
-        {
-            throw new SemanticException(NOT_SUPPORTED, node, "Scalar subqueries not yet supported");
-        }
+        return scalarSubqueries;
     }
 
     private class Visitor
-            extends AstVisitor<Type, AnalysisContext>
+            extends StackableAstVisitor<Type, AnalysisContext>
     {
-        private final TupleDescriptor tupleDescriptor;
+        private final RelationType tupleDescriptor;
 
-        private Visitor(TupleDescriptor tupleDescriptor)
+        private Visitor(RelationType tupleDescriptor)
         {
             this.tupleDescriptor = requireNonNull(tupleDescriptor, "tupleDescriptor is null");
         }
 
         @SuppressWarnings("SuspiciousMethodCalls")
         @Override
-        public Type process(Node node, @Nullable AnalysisContext context)
+        public Type process(Node node, @Nullable StackableAstVisitorContext<AnalysisContext> context)
         {
             // don't double process a node
             Type type = expressionTypes.get(node);
@@ -234,7 +216,7 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitRow(Row node, AnalysisContext context)
+        protected Type visitRow(Row node, StackableAstVisitorContext<AnalysisContext> context)
         {
             List<Type> types = node.getItems().stream()
                     .map((child) -> process(child, context))
@@ -247,7 +229,7 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitCurrentTime(CurrentTime node, AnalysisContext context)
+        protected Type visitCurrentTime(CurrentTime node, StackableAstVisitorContext<AnalysisContext> context)
         {
             if (node.getPrecision() != null) {
                 throw new SemanticException(NOT_SUPPORTED, node, "non-default precision not yet supported");
@@ -279,7 +261,7 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitQualifiedNameReference(QualifiedNameReference node, AnalysisContext context)
+        protected Type visitQualifiedNameReference(QualifiedNameReference node, StackableAstVisitorContext<AnalysisContext> context)
         {
             List<Field> matches = tupleDescriptor.resolveFields(node.getName());
             if (matches.isEmpty()) {
@@ -298,7 +280,7 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitDereferenceExpression(DereferenceExpression node, AnalysisContext context)
+        protected Type visitDereferenceExpression(DereferenceExpression node, StackableAstVisitorContext<AnalysisContext> context)
         {
             QualifiedName qualifiedName = DereferenceExpression.getQualifiedName(node);
 
@@ -316,6 +298,8 @@ public class ExpressionAnalyzer
                     expressionTypes.put(node, field.getType());
                     return field.getType();
                 }
+
+                assertColumnPrefix(qualifiedName, node);
             }
 
             Type baseType = process(node.getBase(), context);
@@ -340,13 +324,28 @@ public class ExpressionAnalyzer
             return rowFieldType;
         }
 
+        private void assertColumnPrefix(QualifiedName qualifiedName, Expression node)
+        {
+            // Recursively check if its prefix is a column.
+            while (qualifiedName.getPrefix().isPresent()) {
+                qualifiedName = qualifiedName.getPrefix().get();
+                List<Field> matches = tupleDescriptor.resolveFields(qualifiedName);
+                if (matches.size() > 0) {
+                    // The AMBIGUOUS_ATTRIBUTE exception will be thrown later with the right node if matches.size() > 1
+                    return;
+                }
+            }
+
+            throw createMissingAttributeException(node);
+        }
+
         private SemanticException createMissingAttributeException(Expression node)
         {
             return new SemanticException(MISSING_ATTRIBUTE, node, "Column '%s' cannot be resolved", node);
         }
 
         @Override
-        protected Type visitNotExpression(NotExpression node, AnalysisContext context)
+        protected Type visitNotExpression(NotExpression node, StackableAstVisitorContext<AnalysisContext> context)
         {
             coerceType(context, node.getValue(), BOOLEAN, "Value of logical NOT expression");
 
@@ -355,7 +354,7 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitLogicalBinaryExpression(LogicalBinaryExpression node, AnalysisContext context)
+        protected Type visitLogicalBinaryExpression(LogicalBinaryExpression node, StackableAstVisitorContext<AnalysisContext> context)
         {
             coerceType(context, node.getLeft(), BOOLEAN, "Left side of logical expression");
             coerceType(context, node.getRight(), BOOLEAN, "Right side of logical expression");
@@ -365,7 +364,7 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitComparisonExpression(ComparisonExpression node, AnalysisContext context)
+        protected Type visitComparisonExpression(ComparisonExpression node, StackableAstVisitorContext<AnalysisContext> context)
         {
             OperatorType operatorType;
             if (node.getType() == ComparisonExpression.Type.IS_DISTINCT_FROM) {
@@ -378,7 +377,7 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitIsNullPredicate(IsNullPredicate node, AnalysisContext context)
+        protected Type visitIsNullPredicate(IsNullPredicate node, StackableAstVisitorContext<AnalysisContext> context)
         {
             process(node.getValue(), context);
 
@@ -387,7 +386,7 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitIsNotNullPredicate(IsNotNullPredicate node, AnalysisContext context)
+        protected Type visitIsNotNullPredicate(IsNotNullPredicate node, StackableAstVisitorContext<AnalysisContext> context)
         {
             process(node.getValue(), context);
 
@@ -396,12 +395,12 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitNullIfExpression(NullIfExpression node, AnalysisContext context)
+        protected Type visitNullIfExpression(NullIfExpression node, StackableAstVisitorContext<AnalysisContext> context)
         {
             Type firstType = process(node.getFirst(), context);
             Type secondType = process(node.getSecond(), context);
 
-            if (!getCommonSuperType(firstType, secondType).isPresent()) {
+            if (!getCommonSuperTypeSignature(firstType.getTypeSignature(), secondType.getTypeSignature()).isPresent()) {
                 throw new SemanticException(TYPE_MISMATCH, node, "Types are not comparable with NULLIF: %s vs %s", firstType, secondType);
             }
 
@@ -410,7 +409,7 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitIfExpression(IfExpression node, AnalysisContext context)
+        protected Type visitIfExpression(IfExpression node, StackableAstVisitorContext<AnalysisContext> context)
         {
             coerceType(context, node.getCondition(), BOOLEAN, "IF condition");
 
@@ -427,7 +426,7 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitSearchedCaseExpression(SearchedCaseExpression node, AnalysisContext context)
+        protected Type visitSearchedCaseExpression(SearchedCaseExpression node, StackableAstVisitorContext<AnalysisContext> context)
         {
             for (WhenClause whenClause : node.getWhenClauses()) {
                 coerceType(context, whenClause.getOperand(), BOOLEAN, "CASE WHEN clause");
@@ -448,10 +447,10 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitSimpleCaseExpression(SimpleCaseExpression node, AnalysisContext context)
+        protected Type visitSimpleCaseExpression(SimpleCaseExpression node, StackableAstVisitorContext<AnalysisContext> context)
         {
             for (WhenClause whenClause : node.getWhenClauses()) {
-                coerceToSingleType(context, node, "CASE operand type does not match WHEN clause operand type: %s vs %s", node.getOperand(), whenClause.getOperand());
+                coerceToSingleType(context, whenClause, "CASE operand type does not match WHEN clause operand type: %s vs %s", node.getOperand(), whenClause.getOperand());
             }
 
             Type type = coerceToSingleType(context,
@@ -479,7 +478,7 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitCoalesceExpression(CoalesceExpression node, AnalysisContext context)
+        protected Type visitCoalesceExpression(CoalesceExpression node, StackableAstVisitorContext<AnalysisContext> context)
         {
             Type type = coerceToSingleType(context, "All COALESCE operands must be the same type: %s", node.getOperands());
 
@@ -488,7 +487,7 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitArithmeticUnary(ArithmeticUnaryExpression node, AnalysisContext context)
+        protected Type visitArithmeticUnary(ArithmeticUnaryExpression node, StackableAstVisitorContext<AnalysisContext> context)
         {
             switch (node.getSign()) {
                 case PLUS:
@@ -509,13 +508,13 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitArithmeticBinary(ArithmeticBinaryExpression node, AnalysisContext context)
+        protected Type visitArithmeticBinary(ArithmeticBinaryExpression node, StackableAstVisitorContext<AnalysisContext> context)
         {
             return getOperator(context, node, OperatorType.valueOf(node.getType().name()), node.getLeft(), node.getRight());
         }
 
         @Override
-        protected Type visitLikePredicate(LikePredicate node, AnalysisContext context)
+        protected Type visitLikePredicate(LikePredicate node, StackableAstVisitorContext<AnalysisContext> context)
         {
             coerceType(context, node.getValue(), VARCHAR, "Left side of LIKE expression");
             coerceType(context, node.getPattern(), VARCHAR, "Pattern for LIKE expression");
@@ -528,13 +527,13 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitSubscriptExpression(SubscriptExpression node, AnalysisContext context)
+        protected Type visitSubscriptExpression(SubscriptExpression node, StackableAstVisitorContext<AnalysisContext> context)
         {
             return getOperator(context, node, SUBSCRIPT, node.getBase(), node.getIndex());
         }
 
         @Override
-        protected Type visitArrayConstructor(ArrayConstructor node, AnalysisContext context)
+        protected Type visitArrayConstructor(ArrayConstructor node, StackableAstVisitorContext<AnalysisContext> context)
         {
             Type type = coerceToSingleType(context, "All ARRAY elements must be the same type: %s", node.getValues());
             Type arrayType = typeManager.getParameterizedType(ARRAY.getName(), ImmutableList.of(type.getTypeSignature()), ImmutableList.of());
@@ -543,35 +542,41 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitStringLiteral(StringLiteral node, AnalysisContext context)
+        protected Type visitStringLiteral(StringLiteral node, StackableAstVisitorContext<AnalysisContext> context)
         {
             expressionTypes.put(node, VARCHAR);
             return VARCHAR;
         }
 
+        protected Type visitBinaryLiteral(BinaryLiteral node, StackableAstVisitorContext<AnalysisContext> context)
+        {
+            expressionTypes.put(node, VARBINARY);
+            return VARBINARY;
+        }
+
         @Override
-        protected Type visitLongLiteral(LongLiteral node, AnalysisContext context)
+        protected Type visitLongLiteral(LongLiteral node, StackableAstVisitorContext<AnalysisContext> context)
         {
             expressionTypes.put(node, BIGINT);
             return BIGINT;
         }
 
         @Override
-        protected Type visitDoubleLiteral(DoubleLiteral node, AnalysisContext context)
+        protected Type visitDoubleLiteral(DoubleLiteral node, StackableAstVisitorContext<AnalysisContext> context)
         {
             expressionTypes.put(node, DOUBLE);
             return DOUBLE;
         }
 
         @Override
-        protected Type visitBooleanLiteral(BooleanLiteral node, AnalysisContext context)
+        protected Type visitBooleanLiteral(BooleanLiteral node, StackableAstVisitorContext<AnalysisContext> context)
         {
             expressionTypes.put(node, BOOLEAN);
             return BOOLEAN;
         }
 
         @Override
-        protected Type visitGenericLiteral(GenericLiteral node, AnalysisContext context)
+        protected Type visitGenericLiteral(GenericLiteral node, StackableAstVisitorContext<AnalysisContext> context)
         {
             Type type = typeManager.getType(parseTypeSignature(node.getType()));
             if (type == null) {
@@ -592,7 +597,7 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitTimeLiteral(TimeLiteral node, AnalysisContext context)
+        protected Type visitTimeLiteral(TimeLiteral node, StackableAstVisitorContext<AnalysisContext> context)
         {
             Type type;
             if (timeHasTimeZone(node.getValue())) {
@@ -606,7 +611,7 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitTimestampLiteral(TimestampLiteral node, AnalysisContext context)
+        protected Type visitTimestampLiteral(TimestampLiteral node, StackableAstVisitorContext<AnalysisContext> context)
         {
             try {
                 parseTimestampLiteral(session.getTimeZoneKey(), node.getValue());
@@ -627,7 +632,7 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitIntervalLiteral(IntervalLiteral node, AnalysisContext context)
+        protected Type visitIntervalLiteral(IntervalLiteral node, StackableAstVisitorContext<AnalysisContext> context)
         {
             Type type;
             if (node.isYearToMonth()) {
@@ -641,14 +646,14 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitNullLiteral(NullLiteral node, AnalysisContext context)
+        protected Type visitNullLiteral(NullLiteral node, StackableAstVisitorContext<AnalysisContext> context)
         {
             expressionTypes.put(node, UNKNOWN);
             return UNKNOWN;
         }
 
         @Override
-        protected Type visitFunctionCall(FunctionCall node, AnalysisContext context)
+        protected Type visitFunctionCall(FunctionCall node, StackableAstVisitorContext<AnalysisContext> context)
         {
             if (node.getWindow().isPresent()) {
                 for (Expression expression : node.getWindow().get().getPartitionBy()) {
@@ -691,7 +696,17 @@ public class ExpressionAnalyzer
                 argumentTypes.add(process(expression, context).getTypeSignature());
             }
 
-            Signature function = functionRegistry.resolveFunction(node.getName(), argumentTypes.build(), context.isApproximate());
+            Signature function;
+            try {
+                function = functionRegistry.resolveFunction(node.getName(), argumentTypes.build(), context.getContext().isApproximate());
+            }
+            catch (PrestoException e) {
+                if (e.getErrorCode().getCode() == StandardErrorCode.FUNCTION_NOT_FOUND.toErrorCode().getCode()) {
+                    throw new SemanticException(SemanticErrorCode.FUNCTION_NOT_FOUND, node, e.getMessage());
+                }
+                throw e;
+            }
+
             for (int i = 0; i < node.getArguments().size(); i++) {
                 Expression expression = node.getArguments().get(i);
                 Type type = typeManager.getType(function.getArgumentTypes().get(i));
@@ -710,7 +725,7 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitExtract(Extract node, AnalysisContext context)
+        protected Type visitExtract(Extract node, StackableAstVisitorContext<AnalysisContext> context)
         {
             Type type = process(node.getExpression(), context);
             if (!isDateTimeType(type)) {
@@ -737,13 +752,13 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitBetweenPredicate(BetweenPredicate node, AnalysisContext context)
+        protected Type visitBetweenPredicate(BetweenPredicate node, StackableAstVisitorContext<AnalysisContext> context)
         {
             return getOperator(context, node, OperatorType.BETWEEN, node.getValue(), node.getMin(), node.getMax());
         }
 
         @Override
-        public Type visitCast(Cast node, AnalysisContext context)
+        public Type visitCast(Cast node, StackableAstVisitorContext<AnalysisContext> context)
         {
             Type type = typeManager.getType(parseTypeSignature(node.getType()));
             if (type == null) {
@@ -769,7 +784,7 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitInPredicate(InPredicate node, AnalysisContext context)
+        protected Type visitInPredicate(InPredicate node, StackableAstVisitorContext<AnalysisContext> context)
         {
             Expression value = node.getValue();
             process(value, context);
@@ -786,7 +801,6 @@ public class ExpressionAnalyzer
             }
             else if (valueList instanceof SubqueryExpression) {
                 coerceToSingleType(context, node, "value and result of subquery must be of the same type for IN expression: %s vs %s", value, valueList);
-                subqueryInPredicates.add(node);
             }
 
             expressionTypes.put(node, BOOLEAN);
@@ -794,7 +808,7 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitInListExpression(InListExpression node, AnalysisContext context)
+        protected Type visitInListExpression(InListExpression node, StackableAstVisitorContext<AnalysisContext> context)
         {
             Type type = coerceToSingleType(context, "All IN list values must be the same type: %s", node.getValues());
 
@@ -803,27 +817,34 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitSubqueryExpression(SubqueryExpression node, AnalysisContext context)
+        protected Type visitSubqueryExpression(SubqueryExpression node, StackableAstVisitorContext<AnalysisContext> context)
         {
             StatementAnalyzer analyzer = statementAnalyzerFactory.apply(node);
-            TupleDescriptor descriptor = analyzer.process(node.getQuery(), context);
+            RelationType descriptor = analyzer.process(node.getQuery(), context.getContext());
 
-            // Scalar subqueries should only produce one column
+            // Subquery should only produce one column
             if (descriptor.getVisibleFieldCount() != 1) {
-                throw new SemanticException(MULTIPLE_FIELDS_FROM_SCALAR_SUBQUERY,
+                throw new SemanticException(MULTIPLE_FIELDS_FROM_SUBQUERY,
                         node,
-                        "Subquery expression must produce only one field. Found %s",
+                        "Multiple columns returned by subquery are not yet supported. Found %s",
                         descriptor.getVisibleFieldCount());
             }
 
-            Type type = Iterables.getOnlyElement(descriptor.getVisibleFields()).getType();
+            Optional<Node> previousNode = context.getPreviousNode();
+            if (previousNode.isPresent() && previousNode.get() instanceof InPredicate && ((InPredicate) previousNode.get()).getValue() != node) {
+                subqueryInPredicates.add((InPredicate) previousNode.get());
+            }
+            else {
+                scalarSubqueries.add(node);
+            }
 
+            Type type = Iterables.getOnlyElement(descriptor.getVisibleFields()).getType();
             expressionTypes.put(node, type);
             return type;
         }
 
         @Override
-        public Type visitInputReference(InputReference node, AnalysisContext context)
+        public Type visitInputReference(InputReference node, StackableAstVisitorContext<AnalysisContext> context)
         {
             Type type = tupleDescriptor.getFieldByIndex(node.getChannel()).getType();
             expressionTypes.put(node, type);
@@ -831,12 +852,12 @@ public class ExpressionAnalyzer
         }
 
         @Override
-        protected Type visitExpression(Expression node, AnalysisContext context)
+        protected Type visitExpression(Expression node, StackableAstVisitorContext<AnalysisContext> context)
         {
             throw new SemanticException(NOT_SUPPORTED, node, "not yet implemented: " + node.getClass().getName());
         }
 
-        private Type getOperator(AnalysisContext context, Expression node, OperatorType operatorType, Expression... arguments)
+        private Type getOperator(StackableAstVisitorContext<AnalysisContext> context, Expression node, OperatorType operatorType, Expression... arguments)
         {
             ImmutableList.Builder<Type> argumentTypes = ImmutableList.builder();
             for (Expression expression : arguments) {
@@ -863,7 +884,7 @@ public class ExpressionAnalyzer
             return type;
         }
 
-        private void coerceType(AnalysisContext context, Expression expression, Type expectedType, String message)
+        private void coerceType(StackableAstVisitorContext<AnalysisContext> context, Expression expression, Type expectedType, String message)
         {
             Type actualType = process(expression, context);
             if (!actualType.equals(expectedType)) {
@@ -874,7 +895,7 @@ public class ExpressionAnalyzer
             }
         }
 
-        private Type coerceToSingleType(AnalysisContext context, Node node, String message, Expression first, Expression second)
+        private Type coerceToSingleType(StackableAstVisitorContext<AnalysisContext> context, Node node, String message, Expression first, Expression second)
         {
             Type firstType = null;
             if (first != null) {
@@ -907,12 +928,12 @@ public class ExpressionAnalyzer
             throw new SemanticException(TYPE_MISMATCH, node, message, firstType, secondType);
         }
 
-        private Type coerceToSingleType(AnalysisContext context, String message, List<Expression> expressions)
+        private Type coerceToSingleType(StackableAstVisitorContext<AnalysisContext> context, String message, List<Expression> expressions)
         {
             // determine super type
             Type superType = UNKNOWN;
             for (Expression expression : expressions) {
-                Optional<Type> newSuperType = getCommonSuperType(superType, process(expression, context));
+                Optional<Type> newSuperType = typeManager.getCommonSuperType(superType, process(expression, context));
                 if (!newSuperType.isPresent()) {
                     throw new SemanticException(TYPE_MISMATCH, expression, message, superType);
                 }
@@ -989,7 +1010,7 @@ public class ExpressionAnalyzer
                 })
                 .collect(toImmutableList());
 
-        return analyzeExpressions(session, metadata, sqlParser, new TupleDescriptor(fields), expressions);
+        return analyzeExpressions(session, metadata, sqlParser, new RelationType(fields), expressions);
     }
 
     private static ExpressionAnalysis analyzeExpressionsWithInputs(
@@ -1003,7 +1024,7 @@ public class ExpressionAnalyzer
         for (Entry<Integer, Type> entry : types.entrySet()) {
             fields[entry.getKey()] = Field.newUnqualified(Optional.empty(), entry.getValue());
         }
-        TupleDescriptor tupleDescriptor = new TupleDescriptor(fields);
+        RelationType tupleDescriptor = new RelationType(fields);
 
         return analyzeExpressions(session, metadata, sqlParser, tupleDescriptor, expressions);
     }
@@ -1012,7 +1033,7 @@ public class ExpressionAnalyzer
             Session session,
             Metadata metadata,
             SqlParser sqlParser,
-            TupleDescriptor tupleDescriptor,
+            RelationType tupleDescriptor,
             Iterable<? extends Expression> expressions)
     {
         // expressions at this point can not have sub queries so deny all access checks
@@ -1026,6 +1047,7 @@ public class ExpressionAnalyzer
                 analyzer.getExpressionTypes(),
                 analyzer.getExpressionCoercions(),
                 analyzer.getSubqueryInPredicates(),
+                analyzer.getScalarSubqueries(),
                 analyzer.getResolvedNames().keySet());
     }
 
@@ -1034,7 +1056,7 @@ public class ExpressionAnalyzer
             Metadata metadata,
             AccessControl accessControl,
             SqlParser sqlParser,
-            TupleDescriptor tupleDescriptor,
+            RelationType tupleDescriptor,
             Analysis analysis,
             boolean approximateQueriesEnabled,
             AnalysisContext context,
@@ -1053,9 +1075,12 @@ public class ExpressionAnalyzer
 
         analysis.addResolvedNames(analyzer.getResolvedNames());
 
-        Set<InPredicate> subqueryInPredicates = analyzer.getSubqueryInPredicates();
-
-        return new ExpressionAnalysis(expressionTypes, expressionCoercions, subqueryInPredicates, analyzer.getResolvedNames().keySet());
+        return new ExpressionAnalysis(
+                expressionTypes,
+                expressionCoercions,
+                analyzer.getSubqueryInPredicates(),
+                analyzer.getScalarSubqueries(),
+                analyzer.getColumnReferences());
     }
 
     public static ExpressionAnalyzer create(

@@ -40,6 +40,7 @@ public final class ExpressionTreeRewriter<C>
         this.visitor = new RewritingVisitor();
     }
 
+    @SuppressWarnings("unchecked")
     public <T extends Expression> T rewrite(T node, C context)
     {
         return (T) visitor.process(node, new Context<>(context, false));
@@ -48,6 +49,7 @@ public final class ExpressionTreeRewriter<C>
     /**
      * Invoke the default rewrite logic explicitly. Specifically, it skips the invocation of the expression rewriter for the provided node.
      */
+    @SuppressWarnings("unchecked")
     public <T extends Expression> T defaultRewrite(T node, C context)
     {
         return (T) visitor.process(node, new Context<>(context, true));
@@ -501,6 +503,24 @@ public final class ExpressionTreeRewriter<C>
 
             if (!sameElements(node.getArguments(), arguments.build()) || !sameElements(rewrittenWindow, node.getWindow())) {
                 return new FunctionCall(node.getName(), rewrittenWindow, node.isDistinct(), arguments.build());
+            }
+
+            return node;
+        }
+
+        @Override
+        protected Expression visitLambdaExpression(LambdaExpression node, Context<C> context)
+        {
+            if (!context.isDefaultRewrite()) {
+                Expression result = rewriter.rewriteLambdaExpression(node, context.get(), ExpressionTreeRewriter.this);
+                if (result != null) {
+                    return result;
+                }
+            }
+
+            Expression body = rewrite(node.getBody(), context.get());
+            if (body != node.getBody()) {
+                return new LambdaExpression(node.getArguments(), body);
             }
 
             return node;

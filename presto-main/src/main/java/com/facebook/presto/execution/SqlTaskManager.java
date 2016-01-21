@@ -17,6 +17,7 @@ import com.facebook.presto.OutputBuffers;
 import com.facebook.presto.Session;
 import com.facebook.presto.TaskSource;
 import com.facebook.presto.event.query.QueryMonitor;
+import com.facebook.presto.execution.StateMachine.StateChangeListener;
 import com.facebook.presto.memory.LocalMemoryManager;
 import com.facebook.presto.memory.MemoryManagerConfig;
 import com.facebook.presto.memory.MemoryPoolAssignment;
@@ -52,6 +53,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
+import static com.facebook.presto.SystemSessionProperties.resourceOvercommit;
 import static com.google.common.base.Predicates.notNull;
 import static com.google.common.collect.Iterables.filter;
 import static com.google.common.collect.Iterables.transform;
@@ -133,7 +135,6 @@ public class SqlTaskManager
             {
                 return new SqlTask(
                         taskId,
-                        nodeInfo.getInstanceId(),
                         locationFactory.createLocalTaskLocation(taskId),
                         queryContexts.getUnchecked(taskId.getQueryId()),
                         sqlTaskExecutionFactory,
@@ -258,6 +259,11 @@ public class SqlTaskManager
         requireNonNull(sources, "sources is null");
         requireNonNull(outputBuffers, "outputBuffers is null");
 
+        if (resourceOvercommit(session)) {
+            // TODO: This should have been done when the QueryContext was created. However, the session isn't available at that point.
+            queryContexts.getUnchecked(taskId.getQueryId()).setResourceOvercommit();
+        }
+
         SqlTask sqlTask = tasks.getUnchecked(taskId);
         sqlTask.recordHeartbeat();
         return sqlTask.updateTask(session, fragment, sources, outputBuffers);
@@ -355,5 +361,12 @@ public class SqlTaskManager
                 .forEach(task -> tempIoStats.merge(task.getIoStats()));
 
         cachedStats.resetTo(tempIoStats);
+    }
+
+    @Override
+    public void addStateChangeListener(TaskId taskId, StateChangeListener<TaskState> stateChangeListener)
+    {
+        requireNonNull(taskId, "taskId is null");
+        tasks.getUnchecked(taskId).addStateChangeListener(stateChangeListener);
     }
 }

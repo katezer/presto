@@ -19,9 +19,12 @@ import com.facebook.presto.TaskSource;
 import com.facebook.presto.block.BlockEncodingManager;
 import com.facebook.presto.connector.ConnectorManager;
 import com.facebook.presto.connector.system.CatalogSystemTable;
+import com.facebook.presto.connector.system.GlobalSystemConnector;
+import com.facebook.presto.connector.system.GlobalSystemConnectorFactory;
 import com.facebook.presto.connector.system.NodeSystemTable;
-import com.facebook.presto.connector.system.SystemConnector;
 import com.facebook.presto.connector.system.TablePropertiesSystemTable;
+import com.facebook.presto.connector.system.TransactionsSystemTable;
+import com.facebook.presto.execution.CommitTask;
 import com.facebook.presto.execution.CreateTableTask;
 import com.facebook.presto.execution.CreateViewTask;
 import com.facebook.presto.execution.DataDefinitionTask;
@@ -30,7 +33,9 @@ import com.facebook.presto.execution.DropViewTask;
 import com.facebook.presto.execution.RenameColumnTask;
 import com.facebook.presto.execution.RenameTableTask;
 import com.facebook.presto.execution.ResetSessionTask;
+import com.facebook.presto.execution.RollbackTask;
 import com.facebook.presto.execution.SetSessionTask;
+import com.facebook.presto.execution.StartTransactionTask;
 import com.facebook.presto.execution.TaskManagerConfig;
 import com.facebook.presto.index.IndexManager;
 import com.facebook.presto.metadata.HandleResolver;
@@ -38,7 +43,7 @@ import com.facebook.presto.metadata.InMemoryNodeManager;
 import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.metadata.MetadataManager;
 import com.facebook.presto.metadata.MetadataUtil;
-import com.facebook.presto.metadata.QualifiedTableName;
+import com.facebook.presto.metadata.QualifiedObjectName;
 import com.facebook.presto.metadata.QualifiedTablePrefix;
 import com.facebook.presto.metadata.SessionPropertyManager;
 import com.facebook.presto.metadata.Split;
@@ -64,8 +69,6 @@ import com.facebook.presto.operator.TaskContext;
 import com.facebook.presto.operator.index.IndexJoinLookupStats;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
-import com.facebook.presto.spi.Connector;
-import com.facebook.presto.spi.ConnectorFactory;
 import com.facebook.presto.spi.ConnectorPageSource;
 import com.facebook.presto.spi.Constraint;
 import com.facebook.presto.spi.Plugin;
@@ -73,6 +76,7 @@ import com.facebook.presto.spi.RecordCursor;
 import com.facebook.presto.spi.block.Block;
 import com.facebook.presto.spi.block.BlockBuilder;
 import com.facebook.presto.spi.block.BlockEncodingSerde;
+import com.facebook.presto.spi.connector.ConnectorFactory;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.split.PageSinkManager;
 import com.facebook.presto.split.PageSourceManager;
@@ -97,6 +101,7 @@ import com.facebook.presto.sql.planner.SubPlan;
 import com.facebook.presto.sql.planner.plan.PlanNode;
 import com.facebook.presto.sql.planner.plan.PlanNodeId;
 import com.facebook.presto.sql.planner.plan.TableScanNode;
+import com.facebook.presto.sql.tree.Commit;
 import com.facebook.presto.sql.tree.CreateTable;
 import com.facebook.presto.sql.tree.CreateView;
 import com.facebook.presto.sql.tree.DropTable;
@@ -104,14 +109,19 @@ import com.facebook.presto.sql.tree.DropView;
 import com.facebook.presto.sql.tree.RenameColumn;
 import com.facebook.presto.sql.tree.RenameTable;
 import com.facebook.presto.sql.tree.ResetSession;
+import com.facebook.presto.sql.tree.Rollback;
 import com.facebook.presto.sql.tree.SetSession;
+import com.facebook.presto.sql.tree.StartTransaction;
 import com.facebook.presto.sql.tree.Statement;
+import com.facebook.presto.transaction.TransactionManager;
+import com.facebook.presto.transaction.TransactionManagerConfig;
 import com.facebook.presto.type.TypeRegistry;
 import com.facebook.presto.type.TypeUtils;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
+import io.airlift.units.Duration;
 import org.intellij.lang.annotations.Language;
 
 import java.util.ArrayList;
@@ -119,7 +129,10 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
@@ -128,6 +141,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import static com.facebook.presto.spi.type.BigintType.BIGINT;
 import static com.facebook.presto.sql.testing.TreeAssertions.assertFormattedSql;
 import static com.facebook.presto.testing.TestingTaskContext.createTaskContext;
+import static com.facebook.presto.transaction.TransactionBuilder.transaction;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 import static io.airlift.concurrent.MoreFutures.getFutureValue;
@@ -135,12 +149,14 @@ import static io.airlift.concurrent.Threads.daemonThreadsNamed;
 import static io.airlift.json.JsonCodec.jsonCodec;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.Executors.newCachedThreadPool;
+import static java.util.concurrent.Executors.newSingleThreadScheduledExecutor;
 
 public class LocalQueryRunner
         implements QueryRunner
 {
     private final Session defaultSession;
     private final ExecutorService executor;
+    private final ScheduledExecutorService transactionCheckExecutor;
 
     private final SqlParser sqlParser;
     private final InMemoryNodeManager nodeManager;
@@ -152,6 +168,7 @@ public class LocalQueryRunner
     private final PageSourceManager pageSourceManager;
     private final IndexManager indexManager;
     private final PageSinkManager pageSinkManager;
+    private final TransactionManager transactionManager;
 
     private final ExpressionCompiler compiler;
     private final ConnectorManager connectorManager;
@@ -163,25 +180,37 @@ public class LocalQueryRunner
 
     public LocalQueryRunner(Session defaultSession)
     {
+        this(defaultSession, false);
+    }
+
+    private LocalQueryRunner(Session defaultSession, boolean withInitialTransaction)
+    {
         requireNonNull(defaultSession, "defaultSession is null");
+        checkArgument(!defaultSession.getTransactionId().isPresent() || !withInitialTransaction, "Already in transaction");
+
         this.executor = newCachedThreadPool(daemonThreadsNamed("local-query-runner-%s"));
+        this.transactionCheckExecutor = newSingleThreadScheduledExecutor(daemonThreadsNamed("transaction-idle-check"));
 
         this.sqlParser = new SqlParser();
         this.nodeManager = new InMemoryNodeManager();
         this.typeRegistry = new TypeRegistry();
         this.indexManager = new IndexManager();
         this.pageSinkManager = new PageSinkManager();
+        this.transactionManager = TransactionManager.create(
+                new TransactionManagerConfig().setIdleTimeout(new Duration(1, TimeUnit.DAYS)),
+                transactionCheckExecutor,
+                executor);
 
         this.splitManager = new SplitManager();
         this.blockEncodingSerde = new BlockEncodingManager(typeRegistry);
         this.metadata = new MetadataManager(
                 new FeaturesConfig().setExperimentalSyntaxEnabled(true),
                 typeRegistry,
-                splitManager,
                 blockEncodingSerde,
                 new SessionPropertyManager(),
-                new TablePropertyManager());
-        this.accessControl = new TestingAccessControlManager();
+                new TablePropertyManager(),
+                transactionManager);
+        this.accessControl = new TestingAccessControlManager(transactionManager);
         this.pageSourceManager = new PageSourceManager();
 
         this.compiler = new ExpressionCompiler(metadata);
@@ -194,20 +223,24 @@ public class LocalQueryRunner
                 indexManager,
                 pageSinkManager,
                 new HandleResolver(),
-                ImmutableMap.<String, ConnectorFactory>of(),
-                nodeManager
-        );
+                nodeManager,
+                transactionManager);
 
-        Connector systemConnector = new SystemConnector(nodeManager, ImmutableSet.of(
+        GlobalSystemConnectorFactory globalSystemConnectorFactory = new GlobalSystemConnectorFactory(ImmutableSet.of(
                 new NodeSystemTable(nodeManager),
                 new CatalogSystemTable(metadata),
-                new TablePropertiesSystemTable(metadata)));
+                new TablePropertiesSystemTable(metadata),
+                new TransactionsSystemTable(typeRegistry, transactionManager)),
+                ImmutableSet.of());
 
-        connectorManager.createConnection(SystemConnector.NAME, systemConnector);
+        connectorManager.addConnectorFactory(globalSystemConnectorFactory);
+        connectorManager.createConnection(GlobalSystemConnector.NAME, GlobalSystemConnector.NAME, ImmutableMap.of());
 
         // rewrite session to use managed SessionPropertyMetadata
         this.defaultSession = new Session(
                 defaultSession.getQueryId(),
+                withInitialTransaction ? Optional.of(transactionManager.beginTransaction(false)) : defaultSession.getTransactionId(),
+                defaultSession.isClientTransactionSupport(),
                 defaultSession.getIdentity(),
                 defaultSession.getSource(),
                 defaultSession.getCatalog(),
@@ -230,13 +263,23 @@ public class LocalQueryRunner
                 .put(RenameTable.class, new RenameTableTask())
                 .put(ResetSession.class, new ResetSessionTask())
                 .put(SetSession.class, new SetSessionTask())
+                .put(StartTransaction.class, new StartTransactionTask())
+                .put(Commit.class, new CommitTask())
+                .put(Rollback.class, new RollbackTask())
                 .build();
+    }
+
+    public static LocalQueryRunner queryRunnerWithInitialTransaction(Session defaultSession)
+    {
+        checkArgument(!defaultSession.getTransactionId().isPresent(), "Already in transaction!");
+        return new LocalQueryRunner(defaultSession, true);
     }
 
     @Override
     public void close()
     {
         executor.shutdownNow();
+        transactionCheckExecutor.shutdownNow();
         connectorManager.stop();
     }
 
@@ -254,6 +297,12 @@ public class LocalQueryRunner
     public TypeRegistry getTypeManager()
     {
         return typeRegistry;
+    }
+
+    @Override
+    public TransactionManager getTransactionManager()
+    {
+        return transactionManager;
     }
 
     @Override
@@ -282,7 +331,16 @@ public class LocalQueryRunner
     public void createCatalog(String catalogName, ConnectorFactory connectorFactory, Map<String, String> properties)
     {
         nodeManager.addCurrentNodeDatasource(catalogName);
-        connectorManager.createConnection(catalogName, connectorFactory, properties);
+        connectorManager.addConnectorFactory(connectorFactory);
+        connectorManager.createConnection(catalogName, connectorFactory.getName(), properties);
+    }
+
+    @Deprecated
+    public void createCatalog(String catalogName, com.facebook.presto.spi.ConnectorFactory connectorFactory, Map<String, String> properties)
+    {
+        nodeManager.addCurrentNodeDatasource(catalogName);
+        connectorManager.addConnectorFactory(connectorFactory);
+        connectorManager.createConnection(catalogName, connectorFactory.getName(), properties);
     }
 
     @Override
@@ -306,17 +364,17 @@ public class LocalQueryRunner
     public static class MaterializedOutputFactory
             implements OutputFactory
     {
-        private final AtomicReference<MaterializingOperator> materializingOperator = new AtomicReference<>();
+        private final AtomicReference<MaterializedResult.Builder> materializedResultBuilder = new AtomicReference<>();
 
-        private MaterializingOperator getMaterializingOperator()
+        public MaterializedResult getMaterializedResult()
         {
-            MaterializingOperator operator = materializingOperator.get();
-            checkState(operator != null, "Output not created");
-            return operator;
+            MaterializedResult.Builder resultBuilder = materializedResultBuilder.get();
+            checkState(resultBuilder != null, "Output not created");
+            return resultBuilder.build();
         }
 
         @Override
-        public OperatorFactory createOutputOperator(int operatorId, List<Type> sourceTypes)
+        public OperatorFactory createOutputOperator(int operatorId, PlanNodeId planNodeId, List<Type> sourceTypes)
         {
             requireNonNull(sourceTypes, "sourceType is null");
 
@@ -331,34 +389,43 @@ public class LocalQueryRunner
                 @Override
                 public Operator createOperator(DriverContext driverContext)
                 {
-                    OperatorContext operatorContext = driverContext.addOperatorContext(operatorId, MaterializingOperator.class.getSimpleName());
-                    MaterializingOperator operator = new MaterializingOperator(operatorContext, sourceTypes);
-
-                    if (!materializingOperator.compareAndSet(null, operator)) {
-                        throw new IllegalArgumentException("Output already created");
+                    MaterializedResult.Builder resultBuilder = materializedResultBuilder.get();
+                    if (resultBuilder == null) {
+                        materializedResultBuilder.compareAndSet(null, MaterializedResult.resultBuilder(driverContext.getSession(), sourceTypes));
+                        resultBuilder = materializedResultBuilder.get();
                     }
-                    return operator;
+                    OperatorContext operatorContext = driverContext.addOperatorContext(operatorId, planNodeId, MaterializingOperator.class.getSimpleName());
+                    return new MaterializingOperator(operatorContext, resultBuilder);
                 }
 
                 @Override
                 public void close()
                 {
                 }
+
+                @Override
+                public OperatorFactory duplicate()
+                {
+                    return createOutputOperator(operatorId, planNodeId, sourceTypes);
+                }
             };
         }
     }
 
     @Override
-    public List<QualifiedTableName> listTables(Session session, String catalog, String schema)
+    public List<QualifiedObjectName> listTables(Session session, String catalog, String schema)
     {
         lock.readLock().lock();
         try {
-            return getMetadata().listTables(session, new QualifiedTablePrefix(catalog, schema));
+            return transaction(transactionManager)
+                    .readOnly()
+                    .execute(session, transactionSession -> {
+                        return getMetadata().listTables(transactionSession, new QualifiedTablePrefix(catalog, schema));
+                    });
         }
         finally {
             lock.readLock().unlock();
         }
-
     }
 
     @Override
@@ -366,12 +433,15 @@ public class LocalQueryRunner
     {
         lock.readLock().lock();
         try {
-            return MetadataUtil.tableExists(getMetadata(), session, table);
+            return transaction(transactionManager)
+                    .readOnly()
+                    .execute(session, transactionSession -> {
+                        return MetadataUtil.tableExists(getMetadata(), transactionSession, table);
+                    });
         }
         finally {
             lock.readLock().unlock();
         }
-
     }
 
     @Override
@@ -382,6 +452,15 @@ public class LocalQueryRunner
 
     @Override
     public MaterializedResult execute(Session session, @Language("SQL") String sql)
+    {
+        return transaction(transactionManager)
+                .singleStatement()
+                .execute(session, transactionSession -> {
+                    return executeInternal(transactionSession, sql);
+                });
+    }
+
+    private MaterializedResult executeInternal(Session session, @Language("SQL") String sql)
     {
         lock.readLock().lock();
         try {
@@ -402,12 +481,11 @@ public class LocalQueryRunner
                 done = !processed;
             }
 
-            return outputFactory.getMaterializingOperator().getMaterializedResult();
+            return outputFactory.getMaterializedResult();
         }
         finally {
             lock.readLock().unlock();
         }
-
     }
 
     @Override
@@ -432,7 +510,7 @@ public class LocalQueryRunner
                 .setExperimentalSyntaxEnabled(true)
                 .setDistributedIndexJoinsEnabled(false)
                 .setOptimizeHashGeneration(true);
-        PlanOptimizersFactory planOptimizersFactory = new PlanOptimizersFactory(metadata, sqlParser, indexManager, featuresConfig, true);
+        PlanOptimizersFactory planOptimizersFactory = new PlanOptimizersFactory(metadata, sqlParser, featuresConfig, true);
 
         QueryExplainer queryExplainer = new QueryExplainer(
                 planOptimizersFactory.get(),
@@ -469,12 +547,14 @@ public class LocalQueryRunner
         );
 
         // plan query
-        LocalExecutionPlan localExecutionPlan = executionPlanner.plan(session,
+        LocalExecutionPlan localExecutionPlan = executionPlanner.plan(
+                session,
                 subplan.getFragment().getRoot(),
                 subplan.getFragment().getOutputLayout(),
                 plan.getTypes(),
-                subplan.getFragment().getDistribution(),
-                outputFactory);
+                outputFactory,
+                true,
+                false);
 
         // generate sources
         List<TaskSource> sources = new ArrayList<>();
@@ -519,14 +599,15 @@ public class LocalQueryRunner
         return ImmutableList.copyOf(drivers);
     }
 
-    public OperatorFactory createTableScanOperator(int operatorId, String tableName, String... columnNames)
+    public OperatorFactory createTableScanOperator(int operatorId, PlanNodeId planNodeId, String tableName, String... columnNames)
     {
-        return createTableScanOperator(defaultSession, operatorId, tableName, columnNames);
+        return createTableScanOperator(defaultSession, operatorId, planNodeId, tableName, columnNames);
     }
 
     public OperatorFactory createTableScanOperator(
             Session session,
             int operatorId,
+            PlanNodeId planNodeId,
             String tableName,
             String... columnNames)
     {
@@ -534,7 +615,7 @@ public class LocalQueryRunner
         checkArgument(session.getSchema().isPresent(), "schema not set");
 
         // look up the table
-        QualifiedTableName qualifiedTableName = new QualifiedTableName(session.getCatalog().get(), session.getSchema().get(), tableName);
+        QualifiedObjectName qualifiedTableName = new QualifiedObjectName(session.getCatalog().get(), session.getSchema().get(), tableName);
         TableHandle tableHandle = metadata.getTableHandle(session, qualifiedTableName).orElse(null);
         checkArgument(tableHandle != null, "Table %s does not exist", qualifiedTableName);
 
@@ -554,7 +635,7 @@ public class LocalQueryRunner
 
         // get the split for this table
         List<TableLayoutResult> layouts = metadata.getLayouts(session, tableHandle, Constraint.alwaysTrue(), Optional.empty());
-        Split split = getLocalQuerySplit(layouts.get(0).getLayout().getHandle());
+        Split split = getLocalQuerySplit(session, layouts.get(0).getLayout().getHandle());
 
         return new OperatorFactory()
         {
@@ -567,7 +648,7 @@ public class LocalQueryRunner
             @Override
             public Operator createOperator(DriverContext driverContext)
             {
-                OperatorContext operatorContext = driverContext.addOperatorContext(operatorId, "BenchmarkSource");
+                OperatorContext operatorContext = driverContext.addOperatorContext(operatorId, planNodeId, "BenchmarkSource");
                 ConnectorPageSource pageSource = pageSourceManager.createPageSource(session, split, columnHandles);
                 return new PageSourceOperator(pageSource, columnTypes, operatorContext);
             }
@@ -576,10 +657,16 @@ public class LocalQueryRunner
             public void close()
             {
             }
+
+            @Override
+            public OperatorFactory duplicate()
+            {
+                throw new UnsupportedOperationException();
+            }
         };
     }
 
-    public OperatorFactory createHashProjectOperator(int operatorId, List<Type> columnTypes)
+    public OperatorFactory createHashProjectOperator(int operatorId, PlanNodeId planNodeId, List<Type> columnTypes)
     {
         ImmutableList.Builder<ProjectionFunction> projectionFunctions = ImmutableList.builder();
         for (int i = 0; i < columnTypes.size(); i++) {
@@ -588,13 +675,14 @@ public class LocalQueryRunner
         projectionFunctions.add(new HashProjectionFunction(columnTypes));
         return new FilterAndProjectOperator.FilterAndProjectOperatorFactory(
                 operatorId,
+                planNodeId,
                 new GenericPageProcessor(FilterFunctions.TRUE_FUNCTION, projectionFunctions.build()),
                 ImmutableList.copyOf(Iterables.concat(columnTypes, ImmutableList.of(BIGINT))));
     }
 
-    private Split getLocalQuerySplit(TableLayoutHandle handle)
+    private Split getLocalQuerySplit(Session session, TableLayoutHandle handle)
     {
-        SplitSource splitSource = splitManager.getSplits(defaultSession, handle);
+        SplitSource splitSource = splitManager.getSplits(session, handle);
         List<Split> splits = new ArrayList<>();
         splits.addAll(getFutureValue(splitSource.getNextBatch(1000)));
         while (!splitSource.isFinished()) {
@@ -648,6 +736,18 @@ public class LocalQueryRunner
         public void project(RecordCursor cursor, BlockBuilder output)
         {
             throw new UnsupportedOperationException("Operation not supported");
+        }
+
+        @Override
+        public Set<Integer> getInputChannels()
+        {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean isDeterministic()
+        {
+            throw new UnsupportedOperationException();
         }
     }
 }
