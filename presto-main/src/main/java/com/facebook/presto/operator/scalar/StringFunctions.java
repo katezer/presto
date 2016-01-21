@@ -20,7 +20,9 @@ import com.facebook.presto.spi.block.BlockBuilder;
 import com.facebook.presto.spi.block.BlockBuilderStatus;
 import com.facebook.presto.spi.type.StandardTypes;
 import com.facebook.presto.type.SqlType;
+import com.google.common.io.BaseEncoding;
 import com.google.common.primitives.Ints;
+
 import io.airlift.slice.InvalidCodePointException;
 import io.airlift.slice.InvalidUtf8Exception;
 import io.airlift.slice.Slice;
@@ -452,6 +454,70 @@ public final class StringFunctions
     @SqlType(StandardTypes.VARBINARY)
     public static Slice toUtf8(@SqlType(StandardTypes.VARCHAR) Slice slice)
     {
+        return slice;
+    }
+
+    @Description("encode binary data as hex")
+    @ScalarFunction
+    @SqlType(StandardTypes.VARCHAR)
+    public static Slice toHex(@SqlType(StandardTypes.VARCHAR) Slice slice)
+    {
+        return Slices.utf8Slice(BaseEncoding.base16().encode(slice.getBytes()));
+    }
+
+    @Description("left-padded string with the specified string for the given length")
+    @ScalarFunction
+    @SqlType(StandardTypes.VARCHAR)
+    public static Slice lpad(@SqlType(StandardTypes.VARCHAR) Slice slice, @SqlType(StandardTypes.BIGINT) long length, @SqlType(StandardTypes.VARCHAR) Slice padSlice)
+    {
+        checkCondition(length > -1, INVALID_FUNCTION_ARGUMENT, "Length must be greater or equal than zero");
+        checkCondition(padSlice.length() > 0, INVALID_FUNCTION_ARGUMENT, "The pad may not be the empty string");
+
+         if (slice.length() > length) {
+            return substr(slice, -slice.length(), length);
+        }
+        else if (slice.length() < length) {
+            Slice padded = Slices.allocate(Ints.saturatedCast(length));
+            for (int i = 0; i < (length - slice.length()); i = i + padSlice.length()) {
+                long copyLength = padSlice.length();
+                if (i + padSlice.length() > length) {
+                    copyLength = length - i;
+                }
+                padded.setBytes(i, padSlice, 0, Ints.saturatedCast(copyLength));
+            }
+
+            padded.setBytes(Ints.saturatedCast(length - slice.length()), slice);
+
+            return padded;
+        }
+
+        return slice;
+    }
+
+    @Description("right-padded string with the specified string for the given length")
+    @ScalarFunction
+    @SqlType(StandardTypes.VARCHAR)
+    public static Slice rpad(@SqlType(StandardTypes.VARCHAR) Slice slice, @SqlType(StandardTypes.BIGINT) long length, @SqlType(StandardTypes.VARCHAR) Slice padSlice)
+    {
+        checkCondition(length > -1, INVALID_FUNCTION_ARGUMENT, "Length must be greater or equal than zero");
+        checkCondition(padSlice.length() > 0, INVALID_FUNCTION_ARGUMENT, "The pad may not be the empty string");
+
+        if (slice.length() > length) {
+            return substr(slice, -slice.length(), length);
+        }
+        else if (slice.length() < length) {
+            Slice padded = Slices.allocate(Ints.saturatedCast(length));
+            padded.setBytes(0, slice);
+            for (int i = slice.length(); i < length; i = i + padSlice.length()) {
+                long copyLength = padSlice.length();
+                if (i + padSlice.length() > length) {
+                    copyLength = length - i;
+                }
+                padded.setBytes(i, padSlice, 0, Ints.saturatedCast(copyLength));
+            }
+            return padded;
+        }
+
         return slice;
     }
 }

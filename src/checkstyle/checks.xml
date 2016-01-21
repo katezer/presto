@@ -7,10 +7,12 @@
     <module name="NewlineAtEndOfFile">
         <property name="lineSeparator" value="lf"/>
     </module>
+    <!-- // ADRI
     <module name="RegexpMultiline">
         <property name="format" value="\r"/>
         <property name="message" value="Line contains carriage return"/>
     </module>
+     -->
     <module name="RegexpMultiline">
         <property name="format" value=" \n"/>
         <property name="message" value="Line has trailing whitespace"/>

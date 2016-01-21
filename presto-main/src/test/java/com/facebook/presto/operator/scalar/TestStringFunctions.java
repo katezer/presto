@@ -417,4 +417,48 @@ public class TestStringFunctions
         assertInvalidFunction("from_utf8(to_utf8('hello'), 'foo')", INVALID_FUNCTION_ARGUMENT);
         assertInvalidFunction("from_utf8(to_utf8('hello'), 1114112)", INVALID_FUNCTION_ARGUMENT);
     }
+
+    @Test
+    public void testLpad()
+    {
+        assertFunction("lpad('abcdef', 0, 'abc')", VARCHAR, "");
+        assertFunction("lpad('abcdef', 1, 'abc')", VARCHAR, "a");
+        assertFunction("lpad('abcdef', 2, 'abc')", VARCHAR, "ab");
+        assertFunction("lpad('abcdef', 3, 'abc')", VARCHAR, "abc");
+        assertFunction("lpad('abcdef', 4, 'abc')", VARCHAR, "abcd");
+        assertFunction("lpad('abcdef', 13, 'abc')", VARCHAR, "abcabcaabcdef");
+
+        assertFunction("lpad('', 0, 'abc')", VARCHAR, "");
+        assertFunction("lpad('', 1, 'abc')", VARCHAR, "a");
+        assertFunction("lpad('', 3, 'abc')", VARCHAR, "abc");
+        assertFunction("lpad('', 5, 'abc')", VARCHAR, "abcab");
+        
+        assertInvalidFunction("lpad('abcdef', -1, '')", "Length must be greater or equal than zero");
+        assertInvalidFunction("lpad('abcdef', -999, '')", "Length must be greater or equal than zero");
+        
+        assertInvalidFunction("lpad('abcdef', 0, '')", "The pad may not be the empty string");
+        assertInvalidFunction("lpad('abcdef', 999, '')", "The pad may not be the empty string");
+    }
+    
+    @Test
+    public void testRpad()
+    {
+        assertFunction("rpad('abcdef', 0, 'abc')", VARCHAR, "");
+        assertFunction("rpad('abcdef', 1, 'abc')", VARCHAR, "a");
+        assertFunction("rpad('abcdef', 2, 'abc')", VARCHAR, "ab");
+        assertFunction("rpad('abcdef', 3, 'abc')", VARCHAR, "abc");
+        assertFunction("rpad('abcdef', 4, 'abc')", VARCHAR, "abcd");
+        assertFunction("rpad('abcdef', 13, 'abc')", VARCHAR, "abcdefabcabca");
+
+        assertFunction("rpad('', 0, 'abc')", VARCHAR, "");
+        assertFunction("rpad('', 1, 'abc')", VARCHAR, "a");
+        assertFunction("rpad('', 3, 'abc')", VARCHAR, "abc");
+        assertFunction("rpad('', 5, 'abc')", VARCHAR, "abcab");
+        
+        assertInvalidFunction("rpad('abcdef', -1, '')", "Length must be greater or equal than zero");
+        assertInvalidFunction("rpad('abcdef', -999, '')", "Length must be greater or equal than zero");
+        
+        assertInvalidFunction("rpad('abcdef', 0, '')", "The pad may not be the empty string");
+        assertInvalidFunction("rpad('abcdef', 999, '')", "The pad may not be the empty string");
+    }
 }
