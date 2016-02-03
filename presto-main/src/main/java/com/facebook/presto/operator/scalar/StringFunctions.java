@@ -473,22 +473,20 @@ public final class StringFunctions
         checkCondition(length > -1, INVALID_FUNCTION_ARGUMENT, "Length must be greater or equal than zero");
         checkCondition(padSlice.length() > 0, INVALID_FUNCTION_ARGUMENT, "The pad may not be the empty string");
 
-         if (slice.length() > length) {
-            return substr(slice, -slice.length(), length);
+        if (countCodePoints(slice) > length) {
+            return substr(slice, -countCodePoints(slice), length);
         }
-        else if (slice.length() < length) {
-            Slice padded = Slices.allocate(Ints.saturatedCast(length));
-            for (int i = 0; i < (length - slice.length()); i = i + padSlice.length()) {
-                long copyLength = padSlice.length();
-                if (i + padSlice.length() > length) {
+        else if (countCodePoints(slice) < length) {
+            Slice buffer = Slices.allocate(Ints.saturatedCast(length));
+            for (int i = 0; i < (length - countCodePoints(slice)); i = i + countCodePoints(padSlice)) {
+                long copyLength = countCodePoints(padSlice);
+                if (i + countCodePoints(padSlice) > length) {
                     copyLength = length - i;
                 }
-                padded.setBytes(i, padSlice, 0, Ints.saturatedCast(copyLength));
+                buffer.setBytes(i, padSlice, 0, Ints.saturatedCast(copyLength));
             }
-
-            padded.setBytes(Ints.saturatedCast(length - slice.length()), slice);
-
-            return padded;
+            buffer.setBytes(Ints.saturatedCast(length - countCodePoints(slice)), slice);
+            return buffer;
         }
 
         return slice;
@@ -500,17 +498,17 @@ public final class StringFunctions
     public static Slice rpad(@SqlType(StandardTypes.VARCHAR) Slice slice, @SqlType(StandardTypes.BIGINT) long length, @SqlType(StandardTypes.VARCHAR) Slice padSlice)
     {
         checkCondition(length > -1, INVALID_FUNCTION_ARGUMENT, "Length must be greater or equal than zero");
-        checkCondition(padSlice.length() > 0, INVALID_FUNCTION_ARGUMENT, "The pad may not be the empty string");
+        checkCondition(countCodePoints(padSlice) > 0, INVALID_FUNCTION_ARGUMENT, "The pad may not be the empty string");
 
-        if (slice.length() > length) {
-            return substr(slice, -slice.length(), length);
+        if (countCodePoints(slice) > length) {
+            return substr(slice, -countCodePoints(slice), length);
         }
-        else if (slice.length() < length) {
+        else if (countCodePoints(slice) < length) {
             Slice padded = Slices.allocate(Ints.saturatedCast(length));
             padded.setBytes(0, slice);
-            for (int i = slice.length(); i < length; i = i + padSlice.length()) {
-                long copyLength = padSlice.length();
-                if (i + padSlice.length() > length) {
+            for (int i = countCodePoints(slice); i < length; i = i + countCodePoints(padSlice)) {
+                long copyLength = countCodePoints(padSlice);
+                if (i + countCodePoints(padSlice) > length) {
                     copyLength = length - i;
                 }
                 padded.setBytes(i, padSlice, 0, Ints.saturatedCast(copyLength));
